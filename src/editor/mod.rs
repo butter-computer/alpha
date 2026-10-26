@@ -487,7 +487,7 @@ impl Editor {
 
     // ---- utf16 helpers (platform IME speaks UTF-16) --------------------------
 
-    fn from_utf16(&self, off: usize) -> usize {
+    fn utf16_to_byte(&self, off: usize) -> usize {
         let (mut b, mut u) = (0, 0);
         for ch in self.text().chars() {
             if u >= off {
@@ -513,7 +513,7 @@ impl Editor {
         self.to_utf16(r.start)..self.to_utf16(r.end)
     }
     fn range_from_utf16(&self, r: &Range<usize>) -> Range<usize> {
-        self.from_utf16(r.start)..self.from_utf16(r.end)
+        self.utf16_to_byte(r.start)..self.utf16_to_byte(r.end)
     }
 }
 
