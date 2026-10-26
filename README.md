@@ -64,11 +64,10 @@ markdown, so files save and load as real `.md`.
 
 ## Edge blur (macOS)
 
-`src/edge_blur.rs` adds two native `NSVisualEffectView`s (blending `withinWindow`, theme-matched appearance, gradient-masked
-with a background tint) over the content: one at the top edge and one just above the toolbar, so scrolling text fades and
-blurs out instead of being clipped. Native views sit above everything GPUI draws, so the bottom band ends at the solid toolbar
-and popups/panels are positioned clear of both bands. Not yet verified visually; if `withinWindow` blending does not pick up
-GPUI's Metal layer, the tint still gives a progressive fade, and the fallback is a Metal blur pass in a patched gpui renderer.
+The top and bottom window edges get a progressive blur that fades fully into the window background, so scrolling text
+is blurred and faded instead of clipped. It is a real Metal pass in a patched copy of gpui (`vendor/gpui`, rationale and
+patch in `vendor/README.md`). Tune it via the constants at the top of `src/edge_blur.rs`
+(`TOP`, `BOTTOM_EXTRA`, `MAX_RADIUS`, `EDGE_FADE`). The toolbar row is solid background; the blur ramps in the band above it.
 
 ## Known gaps
 

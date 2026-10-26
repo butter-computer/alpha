@@ -79,12 +79,14 @@ impl Element for EditorElement {
                 if let Some((p, lh)) = layout.point_for_offset(caret) {
                     let top = bounds.origin.y + p.y;
                     let bottom = top + lh;
-                    let margin = px(48.);
+                    // Keep the caret clear of the blur bands (top band / toolbar + fade ramp).
+                    let top_margin = px(crate::edge_blur::TOP + 16.);
+                    let bottom_margin = px(crate::toolbar::HEIGHT + crate::edge_blur::BOTTOM_EXTRA + 16.);
                     let mut off = scroll.offset();
-                    if top < viewport.top() + margin {
-                        off.y += viewport.top() + margin - top;
-                    } else if bottom > viewport.bottom() - margin {
-                        off.y -= bottom - (viewport.bottom() - margin);
+                    if top < viewport.top() + top_margin {
+                        off.y += viewport.top() + top_margin - top;
+                    } else if bottom > viewport.bottom() - bottom_margin {
+                        off.y -= bottom - (viewport.bottom() - bottom_margin);
                     }
                     if off != scroll.offset() {
                         scroll.set_offset(off);

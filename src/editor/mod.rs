@@ -985,7 +985,8 @@ impl Render for Editor {
                         .max_w(px(COLUMN_WIDTH + 48.))
                         .px(px(24.))
                         .pt(px(72.))
-                        .pb(px(200.))
+                        // At least toolbar + fade band so the last line scrolls fully clear.
+                        .pb(px(crate::toolbar::HEIGHT + crate::edge_blur::BOTTOM_EXTRA + 140.))
                         .child(EditorElement { editor: cx.entity() }),
                 ),
             )

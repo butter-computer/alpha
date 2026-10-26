@@ -8,7 +8,7 @@ use gpui::{
     Styled, div, px,
 };
 
-pub const HEIGHT: f32 = 38.0;
+pub const HEIGHT: f32 = 44.0;
 
 fn button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
@@ -42,11 +42,13 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
 
     div()
         .h(px(HEIGHT))
-        .flex_none()
+        .absolute()
+        .bottom_0()
+        .left_0()
         .w_full()
         .flex()
         .items_center()
-        .px(px(16.))
+        .px(px(24.))
         .font_family(".SystemUIFont")
         .text_size(px(12.))
         .text_color(theme.muted)
