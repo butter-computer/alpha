@@ -1,0 +1,708 @@
+diff --color -ru --exclude=Cargo.toml a/gpui/src/platform/mac/metal_renderer.rs b/gpui/src/platform/mac/metal_renderer.rs
+--- a/gpui/src/platform/mac/metal_renderer.rs	2026-10-26 11:53:35
++++ b/gpui/src/platform/mac/metal_renderer.rs	2026-10-26 12:03:15
+@@ -96,6 +96,43 @@
+     }
+ }
+ 
++/// Progressive edge blur settings (alpha patch). Heights and radius are in points.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct EdgeBlurConfig {
++    /// Height of the blurred band at the top of the window.
++    pub top: f32,
++    /// Height of the blurred band at the bottom of the window.
++    pub bottom: f32,
++    /// Part of the bottom band, measured from the window's bottom edge, that is solid: fully
++    /// blurred and tinted (e.g. the toolbar row). The ramp happens in `bottom - bottom_solid`.
++    pub bottom_solid: f32,
++    /// Blur radius at the window edge (ramps to 0 at the inner edge of each band).
++    pub max_radius: f32,
++    /// Tint colour blended in toward the window edge (framebuffer colour space).
++    pub tint: [f32; 3],
++    /// Tint opacity at the window edge (0..1).
++    pub tint_opacity: f32,
++}
++
++static EDGE_BLUR: Mutex<Option<EdgeBlurConfig>> = Mutex::new(None);
++
++/// Enables, updates (`Some`) or disables (`None`) the edge blur for the app's windows.
++pub fn set_edge_blur(config: Option<EdgeBlurConfig>) {
++    *EDGE_BLUR.lock() = config;
++}
++
++#[repr(C)]
++struct EdgeBlurParams {
++    viewport: [f32; 2],
++    top_px: f32,
++    bottom_px: f32,
++    max_radius_px: f32,
++    tint_max: f32,
++    bottom_solid_px: f32,
++    pad: f32,
++    tint: [f32; 4],
++}
++
+ pub(crate) struct MetalRenderer {
+     device: metal::Device,
+     layer: metal::MetalLayer,
+@@ -117,6 +154,11 @@
+     path_intermediate_texture: Option<metal::Texture>,
+     path_intermediate_msaa_texture: Option<metal::Texture>,
+     path_sample_count: u32,
++    // edge blur (alpha patch)
++    blur_scene_texture: Option<metal::Texture>,
++    blur_temp_texture: Option<metal::Texture>,
++    blur_horizontal_pipeline_state: metal::RenderPipelineState,
++    blur_composite_pipeline_state: metal::RenderPipelineState,
+ }
+ 
+ #[repr(C)]
+@@ -249,6 +291,19 @@
+             MTLPixelFormat::BGRA8Unorm,
+         );
+ 
++        let blur_horizontal_pipeline_state = build_blur_pipeline_state(
++            &device,
++            &library,
++            "edge_blur_horizontal",
++            "edge_blur_horizontal_fragment",
++        );
++        let blur_composite_pipeline_state = build_blur_pipeline_state(
++            &device,
++            &library,
++            "edge_blur_composite",
++            "edge_blur_composite_fragment",
++        );
++
+         let command_queue = device.new_command_queue();
+         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone()));
+         let core_video_texture_cache =
+@@ -274,6 +329,10 @@
+             path_intermediate_texture: None,
+             path_intermediate_msaa_texture: None,
+             path_sample_count: PATH_SAMPLE_COUNT,
++            blur_scene_texture: None,
++            blur_temp_texture: None,
++            blur_horizontal_pipeline_state,
++            blur_composite_pipeline_state,
+         }
+     }
+ 
+@@ -311,8 +370,25 @@
+             height: DevicePixels(size.height as i32),
+         };
+         self.update_path_intermediate_textures(device_pixels_size);
++        self.update_blur_textures(device_pixels_size);
+     }
+ 
++    fn update_blur_textures(&mut self, size: Size<DevicePixels>) {
++        if size.width.0 <= 0 || size.height.0 <= 0 {
++            self.blur_scene_texture = None;
++            self.blur_temp_texture = None;
++            return;
++        }
++        let descriptor = metal::TextureDescriptor::new();
++        descriptor.set_width(size.width.0 as u64);
++        descriptor.set_height(size.height.0 as u64);
++        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
++        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
++        descriptor.set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
++        self.blur_scene_texture = Some(self.device.new_texture(&descriptor));
++        self.blur_temp_texture = Some(self.device.new_texture(&descriptor));
++    }
++
+     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
+         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
+@@ -367,11 +443,30 @@
+             return;
+         };
+ 
++        // With edge blur active the scene renders offscreen and the bands are
++        // blurred while copying into the drawable.
++        let blur = (*EDGE_BLUR.lock()).filter(|c| {
++            (c.top > 0. || c.bottom > 0.)
++                && self.blur_scene_texture.as_ref().is_some_and(|t| {
++                    t.width() == viewport_size.width.0 as u64 && t.height() == viewport_size.height.0 as u64
++                })
++        });
++        let target_texture = match blur {
++            Some(_) => self.blur_scene_texture.clone().unwrap(),
++            None => drawable.texture().to_owned(),
++        };
++
+         loop {
+             let mut instance_buffer = self.instance_buffer_pool.lock().acquire(&self.device);
+ 
+-            let command_buffer =
+-                self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size);
++            let command_buffer = self.draw_primitives(
++                scene,
++                &mut instance_buffer,
++                &target_texture,
++                drawable.texture(),
++                viewport_size,
++                blur,
++            );
+ 
+             match command_buffer {
+                 Ok(command_buffer) => {
+@@ -416,41 +511,192 @@
+         }
+     }
+ 
++    /// Blurs the top/bottom bands of the rendered scene and writes the final
++    /// frame into `drawable`. Pass 1 blurs horizontally into a temp texture
++    /// (only the band rows, scissored); pass 2 blurs vertically, tints, and
++    /// copies the untouched middle of the scene.
++    fn encode_edge_blur(
++        &self,
++        command_buffer: &metal::CommandBufferRef,
++        drawable: &metal::TextureRef,
++        viewport_size: Size<DevicePixels>,
++        config: EdgeBlurConfig,
++    ) {
++        let (Some(scene), Some(temp)) = (&self.blur_scene_texture, &self.blur_temp_texture) else {
++            return;
++        };
++        let scale: f32 = {
++            let s: f64 = unsafe { msg_send![&*self.layer, contentsScale] };
++            if s > 0. { s as f32 } else { 1. }
++        };
++        let (w, h) = (viewport_size.width.0 as f32, viewport_size.height.0 as f32);
++        let top_px = (config.top * scale).clamp(0., h);
++        let bottom_px = (config.bottom * scale).clamp(0., h);
++        let max_radius_px = config.max_radius * scale;
++        let params = EdgeBlurParams {
++            viewport: [w, h],
++            top_px,
++            bottom_px,
++            max_radius_px,
++            tint_max: config.tint_opacity.clamp(0., 1.),
++            bottom_solid_px: (config.bottom_solid * scale).clamp(0., bottom_px),
++            pad: 0.,
++            tint: [config.tint[0], config.tint[1], config.tint[2], 1.],
++        };
++        let params_ptr = &params as *const EdgeBlurParams as *const c_void;
++        let params_len = mem::size_of::<EdgeBlurParams>() as u64;
++        let viewport = metal::MTLViewport {
++            originX: 0.0,
++            originY: 0.0,
++            width: w as f64,
++            height: h as f64,
++            znear: 0.0,
++            zfar: 1.0,
++        };
++
++        // Pass 1: horizontal blur of the band rows (plus the vertical reach of pass 2).
++        let descriptor = metal::RenderPassDescriptor::new();
++        let attachment = descriptor.color_attachments().object_at(0).unwrap();
++        attachment.set_texture(Some(temp));
++        attachment.set_load_action(metal::MTLLoadAction::DontCare);
++        attachment.set_store_action(metal::MTLStoreAction::Store);
++        let encoder = command_buffer.new_render_command_encoder(descriptor);
++        encoder.set_render_pipeline_state(&self.blur_horizontal_pipeline_state);
++        encoder.set_viewport(viewport);
++        encoder.set_fragment_bytes(0, params_len, params_ptr);
++        encoder.set_fragment_texture(0, Some(scene));
++        let reach = max_radius_px.ceil() as u64 + 2;
++        let mut bands: Vec<(u64, u64)> = Vec::new();
++        if top_px > 0. {
++            bands.push((0, ((top_px as u64) + reach).min(h as u64)));
++        }
++        if bottom_px > 0. {
++            let start = (h as u64).saturating_sub(bottom_px as u64 + reach);
++            bands.push((start, h as u64 - start));
++        }
++        for (y, height) in bands {
++            encoder.set_scissor_rect(metal::MTLScissorRect { x: 0, y, width: w as u64, height });
++            encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
++        }
++        encoder.end_encoding();
++
++        // Pass 2: vertical blur + tint + copy into the drawable.
++        let descriptor = metal::RenderPassDescriptor::new();
++        let attachment = descriptor.color_attachments().object_at(0).unwrap();
++        attachment.set_texture(Some(drawable));
++        attachment.set_load_action(metal::MTLLoadAction::DontCare);
++        attachment.set_store_action(metal::MTLStoreAction::Store);
++        let encoder = command_buffer.new_render_command_encoder(descriptor);
++        encoder.set_render_pipeline_state(&self.blur_composite_pipeline_state);
++        encoder.set_viewport(viewport);
++        encoder.set_fragment_bytes(0, params_len, params_ptr);
++        encoder.set_fragment_texture(0, Some(scene));
++        encoder.set_fragment_texture(1, Some(temp));
++        encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
++        encoder.end_encoding();
++    }
++
+     fn draw_primitives(
+         &mut self,
+         scene: &Scene,
+         instance_buffer: &mut InstanceBuffer,
+-        drawable: &metal::MetalDrawableRef,
++        target: &metal::TextureRef,
++        drawable: &metal::TextureRef,
+         viewport_size: Size<DevicePixels>,
++        blur: Option<EdgeBlurConfig>,
+     ) -> Result<metal::CommandBuffer> {
+         let command_queue = self.command_queue.clone();
+         let command_buffer = command_queue.new_command_buffer();
+-        let alpha = if self.layer.is_opaque() { 1. } else { 0. };
+         let mut instance_offset = 0;
+ 
++        match blur {
++            None => self.draw_batches(
++                scene.batches(),
++                scene,
++                instance_buffer,
++                &mut instance_offset,
++                target,
++                viewport_size,
++                command_buffer,
++                true,
++            )?,
++            Some(config) => {
++                // Everything up to the split marker renders offscreen and gets blurred into the
++                // drawable; anything painted after the marker (e.g. the toolbar) is drawn sharp on top.
++                let split = scene.edge_blur_split();
++                self.draw_batches(
++                    scene.batches_range(None, split),
++                    scene,
++                    instance_buffer,
++                    &mut instance_offset,
++                    target,
++                    viewport_size,
++                    command_buffer,
++                    true,
++                )?;
++                self.encode_edge_blur(command_buffer, drawable, viewport_size, config);
++                if let Some(split) = split {
++                    self.draw_batches(
++                        scene.batches_range(Some(split), None),
++                        scene,
++                        instance_buffer,
++                        &mut instance_offset,
++                        drawable,
++                        viewport_size,
++                        command_buffer,
++                        false,
++                    )?;
++                }
++            }
++        }
++
++        instance_buffer.metal_buffer.did_modify_range(NSRange {
++            location: 0,
++            length: instance_offset as NSUInteger,
++        });
++        Ok(command_buffer.to_owned())
++    }
++
++    #[allow(clippy::too_many_arguments)]
++    fn draw_batches<'a>(
++        &mut self,
++        batches: impl Iterator<Item = PrimitiveBatch<'a>>,
++        scene: &Scene,
++        instance_buffer: &mut InstanceBuffer,
++        instance_offset: &mut usize,
++        target: &metal::TextureRef,
++        viewport_size: Size<DevicePixels>,
++        command_buffer: &metal::CommandBufferRef,
++        clear: bool,
++    ) -> Result<()> {
++        let alpha = if self.layer.is_opaque() { 1. } else { 0. };
+         let mut command_encoder = new_command_encoder(
+             command_buffer,
+-            drawable,
++            target,
+             viewport_size,
+             |color_attachment| {
+-                color_attachment.set_load_action(metal::MTLLoadAction::Clear);
+-                color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
++                if clear {
++                    color_attachment.set_load_action(metal::MTLLoadAction::Clear);
++                    color_attachment.set_clear_color(metal::MTLClearColor::new(0., 0., 0., alpha));
++                } else {
++                    color_attachment.set_load_action(metal::MTLLoadAction::Load);
++                }
+             },
+         );
+ 
+-        for batch in scene.batches() {
++        for batch in batches {
+             let ok = match batch {
+                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(
+                     shadows,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+                 PrimitiveBatch::Quads(quads) => self.draw_quads(
+                     quads,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+@@ -460,14 +706,14 @@
+                     let did_draw = self.draw_paths_to_intermediate(
+                         paths,
+                         instance_buffer,
+-                        &mut instance_offset,
++                        instance_offset,
+                         viewport_size,
+                         command_buffer,
+                     );
+ 
+                     command_encoder = new_command_encoder(
+                         command_buffer,
+-                        drawable,
++                        target,
+                         viewport_size,
+                         |color_attachment| {
+                             color_attachment.set_load_action(metal::MTLLoadAction::Load);
+@@ -478,7 +724,7 @@
+                         self.draw_paths_from_intermediate(
+                             paths,
+                             instance_buffer,
+-                            &mut instance_offset,
++                            instance_offset,
+                             viewport_size,
+                             command_encoder,
+                         )
+@@ -489,7 +735,7 @@
+                 PrimitiveBatch::Underlines(underlines) => self.draw_underlines(
+                     underlines,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+@@ -500,7 +746,7 @@
+                     texture_id,
+                     sprites,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+@@ -511,14 +757,14 @@
+                     texture_id,
+                     sprites,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(
+                     surfaces,
+                     instance_buffer,
+-                    &mut instance_offset,
++                    instance_offset,
+                     viewport_size,
+                     command_encoder,
+                 ),
+@@ -539,12 +785,7 @@
+         }
+ 
+         command_encoder.end_encoding();
+-
+-        instance_buffer.metal_buffer.did_modify_range(NSRange {
+-            location: 0,
+-            length: instance_offset as NSUInteger,
+-        });
+-        Ok(command_buffer.to_owned())
++        Ok(())
+     }
+ 
+     fn draw_paths_to_intermediate(
+@@ -1158,7 +1399,7 @@
+ 
+ fn new_command_encoder<'a>(
+     command_buffer: &'a metal::CommandBufferRef,
+-    drawable: &'a metal::MetalDrawableRef,
++    drawable: &'a metal::TextureRef,
+     viewport_size: Size<DevicePixels>,
+     configure_color_attachment: impl Fn(&RenderPassColorAttachmentDescriptorRef),
+ ) -> &'a metal::RenderCommandEncoderRef {
+@@ -1167,7 +1408,7 @@
+         .color_attachments()
+         .object_at(0)
+         .unwrap();
+-    color_attachment.set_texture(Some(drawable.texture()));
++    color_attachment.set_texture(Some(drawable));
+     color_attachment.set_store_action(metal::MTLStoreAction::Store);
+     configure_color_attachment(color_attachment);
+ 
+@@ -1181,6 +1422,30 @@
+         zfar: 1.0,
+     });
+     command_encoder
++}
++
++fn build_blur_pipeline_state(
++    device: &metal::DeviceRef,
++    library: &metal::LibraryRef,
++    label: &str,
++    fragment_fn_name: &str,
++) -> metal::RenderPipelineState {
++    let vertex_fn = library
++        .get_function("edge_blur_vertex", None)
++        .expect("error locating vertex function");
++    let fragment_fn = library
++        .get_function(fragment_fn_name, None)
++        .expect("error locating fragment function");
++    let descriptor = metal::RenderPipelineDescriptor::new();
++    descriptor.set_label(label);
++    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
++    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
++    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
++    color_attachment.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
++    color_attachment.set_blending_enabled(false);
++    device
++        .new_render_pipeline_state(&descriptor)
++        .expect("could not create blur pipeline state")
+ }
+ 
+ fn build_pipeline_state(
+diff --color -ru --exclude=Cargo.toml a/gpui/src/platform/mac/shaders.metal b/gpui/src/platform/mac/shaders.metal
+--- a/gpui/src/platform/mac/shaders.metal	2026-10-26 11:53:35
++++ b/gpui/src/platform/mac/shaders.metal	2026-10-26 12:03:15
+@@ -1237,3 +1237,103 @@
+ 
+   return color;
+ }
++
++// ---------------------------------------------------------------------------
++// alpha patch: progressive edge blur (see vendor/README.md).
++// ---------------------------------------------------------------------------
++struct EdgeBlurParams {
++  float2 viewport;      // framebuffer size in pixels
++  float top_px;         // height of the top band in pixels (0 = off)
++  float bottom_px;      // height of the bottom band in pixels (0 = off)
++  float max_radius_px;  // blur radius at the window edge
++  float tint_max;       // tint opacity at the window edge
++  float bottom_solid_px; // bottom rows that are always fully blurred/tinted (strength 1)
++  float pad;
++  float4 tint;          // tint colour (same colour space as the framebuffer)
++};
++
++struct EdgeBlurVertexOut {
++  float4 position [[position]];
++};
++
++vertex EdgeBlurVertexOut edge_blur_vertex(uint vid [[vertex_id]]) {
++  // Single oversized triangle covering the viewport.
++  float2 p = float2((vid << 1) & 2, vid & 2);
++  EdgeBlurVertexOut out;
++  out.position = float4(p * 2.0 - 1.0, 0.0, 1.0);
++  return out;
++}
++
++// 0 outside the bands, easing smoothly to 1 at the window edge.
++float edge_blur_strength(float y, constant EdgeBlurParams &p) {
++  float s = 0.0;
++  if (p.top_px > 0.0 && y < p.top_px) {
++    float t = 1.0 - y / p.top_px;
++    s = max(s, t * t * (3.0 - 2.0 * t));
++  }
++  float by = p.viewport.y - p.bottom_px;
++  if (p.bottom_px > 0.0 && y > by) {
++    float solid_y = p.viewport.y - p.bottom_solid_px;
++    if (y >= solid_y) {
++      s = 1.0;
++    } else {
++      float t = (y - by) / max(solid_y - by, 1.0);
++      s = max(s, t * t * (3.0 - 2.0 * t));
++    }
++  }
++  return s;
++}
++
++constant int EDGE_BLUR_TAPS = 8;
++
++// Horizontal Gaussian with a per-row radius.
++fragment float4 edge_blur_horizontal_fragment(
++    EdgeBlurVertexOut in [[stage_in]], constant EdgeBlurParams &p [[buffer(0)]],
++    texture2d<float> src [[texture(0)]]) {
++  constexpr sampler smp(coord::pixel, filter::linear, address::clamp_to_edge);
++  float2 pos = in.position.xy;
++  float r = edge_blur_strength(pos.y, p) * p.max_radius_px;
++  if (r < 0.5) {
++    return src.sample(smp, pos);
++  }
++  float step = r / float(EDGE_BLUR_TAPS);
++  float4 sum = float4(0.0);
++  float wsum = 0.0;
++  for (int i = -EDGE_BLUR_TAPS; i <= EDGE_BLUR_TAPS; i++) {
++    // step / sigma == 1/4 for sigma = r/2, so the weights are constant.
++    float w = exp(-float(i * i) / 32.0);
++    sum += src.sample(smp, pos + float2(float(i) * step, 0.0)) * w;
++    wsum += w;
++  }
++  return sum / wsum;
++}
++
++// Vertical Gaussian over the horizontally blurred rows, plus the background
++// tint. Pixels outside the bands are copied from the scene untouched.
++fragment float4 edge_blur_composite_fragment(
++    EdgeBlurVertexOut in [[stage_in]], constant EdgeBlurParams &p [[buffer(0)]],
++    texture2d<float> scene [[texture(0)]], texture2d<float> hblur [[texture(1)]]) {
++  constexpr sampler smp(coord::pixel, filter::linear, address::clamp_to_edge);
++  float2 pos = in.position.xy;
++  float s = edge_blur_strength(pos.y, p);
++  if (s <= 0.0) {
++    return scene.read(uint2(pos));
++  }
++  float r = s * p.max_radius_px;
++  float4 color;
++  if (r < 0.5) {
++    color = scene.read(uint2(pos));
++  } else {
++    float step = r / float(EDGE_BLUR_TAPS);
++    float4 sum = float4(0.0);
++    float wsum = 0.0;
++    for (int i = -EDGE_BLUR_TAPS; i <= EDGE_BLUR_TAPS; i++) {
++      float w = exp(-float(i * i) / 32.0);
++      sum += hblur.sample(smp, pos + float2(0.0, float(i) * step)) * w;
++      wsum += w;
++    }
++    color = sum / wsum;
++  }
++  float3 rgb = mix(color.rgb, p.tint.rgb, p.tint_max * s);
++  return float4(rgb, color.a);
++}
+diff --color -ru --exclude=Cargo.toml a/gpui/src/platform.rs b/gpui/src/platform.rs
+--- a/gpui/src/platform.rs	2026-10-26 11:53:35
++++ b/gpui/src/platform.rs	2026-10-26 11:55:38
+@@ -76,6 +76,8 @@
+ pub(crate) use linux::*;
+ #[cfg(target_os = "macos")]
+ pub(crate) use mac::*;
++#[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
++pub use mac::metal_renderer::{EdgeBlurConfig, set_edge_blur};
+ pub use semantic_version::SemanticVersion;
+ #[cfg(any(test, feature = "test-support"))]
+ pub(crate) use test::*;
+diff --color -ru --exclude=Cargo.toml a/gpui/src/scene.rs b/gpui/src/scene.rs
+--- a/gpui/src/scene.rs	2026-10-26 11:53:35
++++ b/gpui/src/scene.rs	2026-10-26 11:57:40
+@@ -20,6 +20,9 @@
+ 
+ pub(crate) type DrawOrder = u32;
+ 
++/// Border-colour hue that identifies the edge-blur split marker quad (alpha patch).
++pub(crate) const EDGE_BLUR_MARKER_HUE: f32 = 0.123_456;
++
+ #[derive(Default)]
+ pub(crate) struct Scene {
+     pub(crate) paint_operations: Vec<PaintOperation>,
+@@ -144,28 +147,66 @@
+         allow(dead_code)
+     )]
+     pub(crate) fn batches(&self) -> impl Iterator<Item = PrimitiveBatch<'_>> {
++        self.batches_range(None, None)
++    }
++
++    /// Draw order of the edge-blur split marker quad, if one was painted this frame (alpha patch).
++    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++    pub(crate) fn edge_blur_split(&self) -> Option<DrawOrder> {
++        self.quads
++            .iter()
++            .find(|q| q.border_color.a == 0.0 && (q.border_color.h - EDGE_BLUR_MARKER_HUE).abs() < 1e-6)
++            .map(|q| q.order)
++    }
++
++    /// Batches for primitives with `after < order <= upto` (`None` = unbounded). Primitive
++    /// lists are sorted by order after `finish`, so this is a pair of binary searches (alpha patch).
++    #[cfg_attr(
++        all(
++            any(target_os = "linux", target_os = "freebsd"),
++            not(any(feature = "x11", feature = "wayland"))
++        ),
++        allow(dead_code)
++    )]
++    pub(crate) fn batches_range(
++        &self,
++        after: Option<DrawOrder>,
++        upto: Option<DrawOrder>,
++    ) -> impl Iterator<Item = PrimitiveBatch<'_>> {
++        fn slice<T>(items: &[T], after: Option<DrawOrder>, upto: Option<DrawOrder>, order: impl Fn(&T) -> DrawOrder) -> &[T] {
++            let lo = after.map_or(0, |a| items.partition_point(|p| order(p) <= a));
++            let hi = upto.map_or(items.len(), |u| items.partition_point(|p| order(p) <= u));
++            &items[lo..hi.max(lo)]
++        }
++        let shadows = slice(&self.shadows, after, upto, |p| p.order);
++        let quads = slice(&self.quads, after, upto, |p| p.order);
++        let paths = slice(&self.paths, after, upto, |p| p.order);
++        let underlines = slice(&self.underlines, after, upto, |p| p.order);
++        let monochrome_sprites = slice(&self.monochrome_sprites, after, upto, |p| p.order);
++        let polychrome_sprites = slice(&self.polychrome_sprites, after, upto, |p| p.order);
++        let surfaces = slice(&self.surfaces, after, upto, |p| p.order);
+         BatchIterator {
+-            shadows: &self.shadows,
++            shadows,
+             shadows_start: 0,
+-            shadows_iter: self.shadows.iter().peekable(),
+-            quads: &self.quads,
++            shadows_iter: shadows.iter().peekable(),
++            quads,
+             quads_start: 0,
+-            quads_iter: self.quads.iter().peekable(),
+-            paths: &self.paths,
++            quads_iter: quads.iter().peekable(),
++            paths,
+             paths_start: 0,
+-            paths_iter: self.paths.iter().peekable(),
+-            underlines: &self.underlines,
++            paths_iter: paths.iter().peekable(),
++            underlines,
+             underlines_start: 0,
+-            underlines_iter: self.underlines.iter().peekable(),
+-            monochrome_sprites: &self.monochrome_sprites,
++            underlines_iter: underlines.iter().peekable(),
++            monochrome_sprites,
+             monochrome_sprites_start: 0,
+-            monochrome_sprites_iter: self.monochrome_sprites.iter().peekable(),
+-            polychrome_sprites: &self.polychrome_sprites,
++            monochrome_sprites_iter: monochrome_sprites.iter().peekable(),
++            polychrome_sprites,
+             polychrome_sprites_start: 0,
+-            polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+-            surfaces: &self.surfaces,
++            polychrome_sprites_iter: polychrome_sprites.iter().peekable(),
++            surfaces,
+             surfaces_start: 0,
+-            surfaces_iter: self.surfaces.iter().peekable(),
++            surfaces_iter: surfaces.iter().peekable(),
+         }
+     }
+ }
+diff --color -ru --exclude=Cargo.toml a/gpui/src/window.rs b/gpui/src/window.rs
+--- a/gpui/src/window.rs	2026-10-26 11:53:35
++++ b/gpui/src/window.rs	2026-10-26 11:57:40
+@@ -2854,6 +2854,17 @@
+         });
+     }
+ 
++    /// Alpha patch: marks the point in paint order where the macOS edge blur splits the frame.
++    /// Everything painted before this call (and under it) is blurred in the edge bands;
++    /// everything painted after is drawn sharp on top. Call from the root of the element tree.
++    /// Has no effect unless `set_edge_blur` is active.
++    pub fn paint_edge_blur_split(&mut self) {
++        let bounds = Bounds { origin: point(px(0.), px(0.)), size: self.viewport_size() };
++        let mut quad = crate::fill(bounds, crate::transparent_black());
++        quad.border_color = Hsla { h: crate::scene::EDGE_BLUR_MARKER_HUE, s: 0., l: 0., a: 0. };
++        self.paint_quad(quad);
++    }
++
+     /// Paint the given `Path` into the scene for the next frame at the current z-index.
+     ///
+     /// This method should only be called as part of the paint phase of element drawing.
