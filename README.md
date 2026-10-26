@@ -1,5 +1,8 @@
 # alpha
 
+<img width="1987" height="1629" alt="Screenshot 2026-10-27 at 00-04-40" src="https://github.com/user-attachments/assets/975c6c66-b627-4137-b639-6ec0f2e8c633" />
+
+
 A light, minimal markdown writing app for macOS, built with Rust and [GPUI](https://crates.io/crates/gpui).
 One window, one editor, live markdown rendering in place, and a quiet bottom toolbar.
 
