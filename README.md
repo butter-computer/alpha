@@ -13,6 +13,15 @@ cargo run --release -- notes.md  # open a file
 cargo test                       # unit tests
 ```
 
+## Build the Mac app
+
+```sh
+scripts/bundle-mac.sh
+open target/release/bundle/Alpha.app
+```
+
+Builds a release binary and assembles an ad-hoc-signed `Alpha.app` (name, icon, `.md`/`.markdown`/`.txt` document types) so it shows up properly in the Dock and Cmd-Tab. The placeholder icon lives in `assets/icon/`.
+
 ## Shortcuts
 
 | Shortcut | Action |
