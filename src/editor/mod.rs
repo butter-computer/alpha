@@ -62,6 +62,8 @@ pub struct Editor {
     selecting: bool,
     pub(crate) need_scroll: bool,
     pub path: Option<PathBuf>,
+    /// The name given to a document that has no file yet.
+    pub title: Option<String>,
     saved_revision: u64,
     pub find: Find,
     pub placeholder: &'static str,
@@ -87,6 +89,7 @@ impl Editor {
             selecting: false,
             need_scroll: false,
             path,
+            title: None,
             saved_revision,
             find: Find::default(),
             placeholder: crate::placeholders::random(),
@@ -117,6 +120,17 @@ impl Editor {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
+            .or_else(|| self.title.clone())
+            .unwrap_or_else(|| "Untitled".into())
+    }
+
+    /// The name without its extension: what a rename edits and a save suggests.
+    pub fn stem(&self) -> String {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .map(|s| s.to_string_lossy().into_owned())
+            .or_else(|| self.title.clone())
             .unwrap_or_else(|| "Untitled".into())
     }
 
@@ -125,6 +139,7 @@ impl Editor {
         self.m.load(text);
         self.saved_revision = self.m.buffer.revision();
         self.path = path;
+        self.title = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.placeholder = crate::placeholders::random();
         self.changed(cx);
@@ -143,6 +158,9 @@ impl Editor {
 
     /// Call after any model mutation: refreshes find matches and schedules a repaint.
     fn changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(cue) = self.m.cue.take() {
+            crate::sound::play(cue, cx);
+        }
         if !self.find.query.is_empty() {
             self.refresh_matches();
         }

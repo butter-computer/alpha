@@ -16,6 +16,7 @@ pub enum Command {
     Open,
     Save,
     SaveAs,
+    Rename,
     ExportMarkdown,
     ExportHtml,
     Find,
@@ -36,6 +37,7 @@ pub const COMMANDS: &[Entry] = &[
     Entry { command: Command::Open, label: "Open…", shortcut: "⌘O" },
     Entry { command: Command::Save, label: "Save", shortcut: "⌘S" },
     Entry { command: Command::SaveAs, label: "Save As…", shortcut: "⇧⌘S" },
+    Entry { command: Command::Rename, label: "Rename…", shortcut: "" },
     Entry { command: Command::ExportMarkdown, label: "Export Markdown", shortcut: "" },
     Entry { command: Command::ExportHtml, label: "Export HTML", shortcut: "" },
     Entry { command: Command::Find, label: "Find", shortcut: "⌘F" },
@@ -197,7 +199,7 @@ mod tests {
     #[test]
     fn required_commands_present() {
         for label in [
-            "New", "Open…", "Save", "Save As…", "Export Markdown", "Export HTML", "Find",
+            "New", "Open…", "Save", "Save As…", "Rename…", "Export Markdown", "Export HTML", "Find",
             "Toggle Theme", "Increase Font Size", "Decrease Font Size", "Settings",
         ] {
             assert!(COMMANDS.iter().any(|e| e.label == label), "{label}");

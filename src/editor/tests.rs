@@ -1066,3 +1066,101 @@ fn random_sequences_only_ever_produce_parseable_line_structure() {
         h.check();
     }
 }
+
+// ---- sounds -------------------------------------------------------------
+
+use crate::sound::Cue;
+
+impl H {
+    /// Types `s` like `type_`, returning the cue each keystroke registered
+    /// alongside the text typed so far.
+    fn cues(&mut self, s: &str) -> Vec<(String, Cue)> {
+        let mut out = Vec::new();
+        let mut typed = String::new();
+        for ch in s.chars() {
+            self.m.cue = None;
+            self.type_(&ch.to_string());
+            typed.push(ch);
+            if let Some(c) = self.m.cue {
+                out.push((typed.clone(), c));
+            }
+        }
+        out
+    }
+}
+
+fn at(s: &str, c: Cue) -> (String, Cue) {
+    (s.to_string(), c)
+}
+
+#[test]
+fn blocks_sound_once_when_their_marker_completes() {
+    assert_eq!(H::new().cues("# Title"), vec![at("# ", Cue::Heading)]);
+    assert_eq!(H::new().cues("- item"), vec![at("- ", Cue::Block)]);
+    assert_eq!(H::new().cues("1. one"), vec![at("1. ", Cue::Block)]);
+    assert_eq!(H::new().cues("> said"), vec![at("> ", Cue::Block)]);
+    assert_eq!(H::new().cues("---"), vec![at("---", Cue::Block)]);
+}
+
+#[test]
+fn plain_prose_is_silent() {
+    assert!(H::new().cues("just some words, a - b and #tag").is_empty());
+}
+
+#[test]
+fn inline_spans_sound_as_they_close() {
+    assert_eq!(H::new().cues("a `code` b"), vec![at("a `code`", Cue::Inline)]);
+    assert_eq!(H::new().cues("see [it](u) now"), vec![at("see [it](u)", Cue::Inline)]);
+    assert_eq!(H::new().cues("an _em_ word"), vec![at("an _em_", Cue::Inline)]);
+    // Bold passes through italic on its way: each registers once.
+    assert_eq!(H::new().cues("**b**"), vec![at("**b*", Cue::Inline), at("**b**", Cue::Inline)]);
+}
+
+#[test]
+fn typing_inside_an_existing_construct_is_silent() {
+    let mut h = H::new();
+    h.type_("# Title `x`");
+    assert!(h.cues(" more words").is_empty());
+}
+
+#[test]
+fn enter_sounds_list_continuation_and_code_blocks() {
+    let mut h = H::new();
+    h.type_("- one");
+    assert_eq!(h.cues("\n"), vec![at("\n", Cue::Item)]);
+    // Enter on the empty item leaves the list without a sound.
+    assert!(h.cues("\n").is_empty());
+    assert_eq!(H::new().cues("```\n"), vec![at("```\n", Cue::Code)]);
+}
+
+#[test]
+fn checkbox_toggles_sound_their_direction() {
+    let mut h = H::new();
+    h.type_("- [ ] task");
+    h.m.cue = None;
+    h.toggle();
+    assert_eq!(h.m.cue, Some(Cue::Check));
+    h.toggle();
+    assert_eq!(h.m.cue, Some(Cue::Uncheck));
+}
+
+#[test]
+fn slash_menu_blocks_sound_like_typed_ones() {
+    for (query, cue) in [("heading", Cue::Heading), ("bullet", Cue::Block), ("code", Cue::Code), ("divider", Cue::Block)] {
+        let mut h = H::new();
+        h.type_(&format!("/{query}"));
+        h.m.cue = None;
+        h.enter();
+        assert_eq!(h.m.cue, Some(cue), "/{query} -> {:?}", h.text());
+    }
+}
+
+#[test]
+fn paste_and_undo_are_silent() {
+    let mut h = H::new();
+    h.m.cue = None;
+    h.paste("# Pasted\n- list **bold**");
+    assert_eq!(h.m.cue, None);
+    h.undo();
+    assert_eq!(h.m.cue, None);
+}

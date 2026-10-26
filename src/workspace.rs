@@ -5,8 +5,10 @@ use crate::actions::*;
 use crate::editor::Editor;
 use crate::export;
 use crate::findbar::FindBar;
+use crate::input::{InputEvent, LineInput};
 use crate::palette::{Command, Palette, PaletteEvent};
 use crate::settings::{FontChoice, Settings, ThemeMode};
+use crate::sound::{self, Cue};
 use crate::theme::Theme;
 use crate::toolbar;
 use gpui::{
@@ -26,6 +28,9 @@ pub struct Workspace {
     find: Option<Entity<FindBar>>,
     settings_open: bool,
     export_open: bool,
+    /// The toolbar name being edited in place.
+    pub renaming: Option<Entity<LineInput>>,
+    _rename_subs: Vec<Subscription>,
     pub notice: Option<SharedString>,
     notice_gen: u64,
     last_title: String,
@@ -57,6 +62,8 @@ impl Workspace {
             find: None,
             settings_open: false,
             export_open: false,
+            renaming: None,
+            _rename_subs: Vec::new(),
             notice: None,
             notice_gen: 0,
             last_title: String::new(),
@@ -188,6 +195,7 @@ impl Workspace {
             Command::IncreaseFont => self.update_settings(window, cx, |s| s.adjust_font_size(1.0)),
             Command::DecreaseFont => self.update_settings(window, cx, |s| s.adjust_font_size(-1.0)),
             Command::Settings => self.toggle_settings(window, cx),
+            Command::Rename => self.start_rename(window, cx),
         }
     }
 
@@ -294,13 +302,73 @@ impl Workspace {
     }
 
     fn stem(&self, cx: &Context<Self>) -> String {
-        self.editor
-            .read(cx)
-            .path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into())
+        self.editor.read(cx).stem()
+    }
+
+    // ---- rename -------------------------------------------------------------
+
+    /// Turns the toolbar name into an input holding the name, all selected.
+    pub fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.renaming.is_some() {
+            return;
+        }
+        self.close_overlays(window, cx);
+        let stem = self.stem(cx);
+        let input = cx.new(|cx| LineInput::new("Untitled", cx));
+        input.update(cx, |i, cx| i.set_content(&stem, cx));
+        let handle = input.focus_handle(cx);
+        window.focus(&handle);
+        self._rename_subs = vec![
+            cx.subscribe(&input, |_, _, _: &InputEvent, cx| cx.notify()),
+            // Clicking away keeps the new name, as in Finder.
+            cx.on_blur(&handle, window, |this, _, cx| this.finish_rename(true, cx)),
+        ];
+        self.renaming = Some(input);
+        cx.notify();
+    }
+
+    /// Ends a rename, applying it if `keep`: an unsaved document takes the name,
+    /// a saved one has its file renamed next to itself, keeping the extension.
+    pub fn finish_rename(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(input) = self.renaming.take() else { return };
+        self._rename_subs.clear();
+        cx.notify();
+        let Some(name) = keep.then(|| clean_name(&input.read(cx).content)).flatten() else { return };
+        let Some(old) = self.editor.read(cx).path.clone() else {
+            self.editor.update(cx, |e, cx| {
+                e.title = (name != "Untitled").then_some(name);
+                cx.notify();
+            });
+            return;
+        };
+        let ext = old.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "md".into());
+        let new = old.with_file_name(format!("{name}.{ext}"));
+        if new == old {
+            return;
+        }
+        if new.exists() && !same_file(&old, &new) {
+            self.notify_msg(format!("“{name}.{ext}” already exists"), cx);
+            return;
+        }
+        match std::fs::rename(&old, &new) {
+            Ok(()) => self.editor.update(cx, |e, cx| {
+                e.path = Some(new);
+                cx.notify();
+            }),
+            Err(e) => self.notify_msg(format!("Couldn’t rename: {e}"), cx),
+        }
+    }
+
+    /// Enter in the name field: keep the name and go back to writing.
+    pub fn confirm_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_rename(true, cx);
+        self.focus_editor(window, cx);
+    }
+
+    /// Escape in the name field: drop the edit and go back to writing.
+    pub fn cancel_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.finish_rename(false, cx);
+        self.focus_editor(window, cx);
     }
 
     /// Saves to the current path (prompting if there is none or `as_new`).
@@ -325,7 +393,11 @@ impl Workspace {
             };
             match std::fs::write(&path, text) {
                 Ok(()) => {
-                    this.update(cx, |t, cx| t.editor.update(cx, |e, cx| e.mark_saved(path, revision, cx))).ok();
+                    this.update(cx, |t, cx| {
+                        t.editor.update(cx, |e, cx| e.mark_saved(path, revision, cx));
+                        sound::play(Cue::Saved, cx);
+                    })
+                    .ok();
                     true
                 }
                 Err(e) => {
@@ -345,11 +417,18 @@ impl Workspace {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let path = with_extension(path, ext);
             let content = if html { export::markdown_to_html(&text, &stem) } else { text };
-            let msg = match std::fs::write(&path, content) {
+            let written = std::fs::write(&path, content);
+            let msg = match &written {
                 Ok(()) => format!("Exported {}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
                 Err(e) => format!("Couldn’t export: {e}"),
             };
-            this.update(cx, |t, cx| t.notify_msg(msg, cx)).ok();
+            this.update(cx, |t, cx| {
+                if written.is_ok() {
+                    sound::play(Cue::Exported, cx);
+                }
+                t.notify_msg(msg, cx)
+            })
+            .ok();
         })
         .detach();
     }
@@ -382,6 +461,7 @@ impl Workspace {
         let row = |label: &'static str| div().flex().flex_col().gap(px(6.)).child(div().text_size(px(11.)).text_color(theme.muted).child(label));
         let t = settings.theme;
         let f = settings.font;
+        let on = settings.sounds;
         div()
             .absolute()
             .bottom(px(PANEL_BOTTOM))
@@ -434,6 +514,18 @@ impl Workspace {
                         .child(seg("ff-serif", "Serif", f == FontChoice::Serif).on_click(cx.listener(|ws, _, w, cx| ws.update_settings(w, cx, |s| s.font = FontChoice::Serif))))
                         .child(seg("ff-sans", "Sans", f == FontChoice::Sans).on_click(cx.listener(|ws, _, w, cx| ws.update_settings(w, cx, |s| s.font = FontChoice::Sans))))
                         .child(seg("ff-mono", "Mono", f == FontChoice::Mono).on_click(cx.listener(|ws, _, w, cx| ws.update_settings(w, cx, |s| s.font = FontChoice::Mono)))),
+                ),
+            )
+            .child(
+                row("Sounds").child(
+                    div()
+                        .flex()
+                        .gap(px(2.))
+                        .child(seg("snd-on", "On", on).on_click(cx.listener(|ws, _, w, cx| {
+                            ws.update_settings(w, cx, |s| s.sounds = true);
+                            sound::play(Cue::Check, cx);
+                        })))
+                        .child(seg("snd-off", "Off", !on).on_click(cx.listener(|ws, _, w, cx| ws.update_settings(w, cx, |s| s.sounds = false)))),
                 ),
             )
     }
@@ -533,5 +625,45 @@ impl Render for Workspace {
             .children(self.find.clone())
             .when(self.settings_open, |d| d.child(self.settings_panel(theme, &settings, cx)))
             .when(self.export_open, |d| d.child(self.export_menu(theme, cx)))
+    }
+}
+
+/// A typed name made safe to use as a file stem: trimmed, no path separators,
+/// not hidden, without a markdown extension the user typed themselves.
+/// `None` when nothing usable is left.
+fn clean_name(raw: &str) -> Option<String> {
+    let mut name = raw.trim().replace(['/', ':'], "-");
+    for ext in [".md", ".markdown"] {
+        if name.len() > ext.len() && name.to_lowercase().ends_with(ext) {
+            name.truncate(name.len() - ext.len());
+        }
+    }
+    let name = name.trim().trim_start_matches('.').trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Whether two paths are the same file (a case-only rename on a case-insensitive disk).
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean_name;
+
+    #[test]
+    fn names_are_cleaned_for_the_file_system() {
+        assert_eq!(clean_name("  Notes  ").as_deref(), Some("Notes"));
+        assert_eq!(clean_name("draft.md").as_deref(), Some("draft"));
+        assert_eq!(clean_name("Draft.MD").as_deref(), Some("Draft"));
+        assert_eq!(clean_name("a/b:c").as_deref(), Some("a-b-c"));
+        assert_eq!(clean_name(".hidden").as_deref(), Some("hidden"));
+        assert_eq!(clean_name("v1.2 notes").as_deref(), Some("v1.2 notes"));
+        assert_eq!(clean_name("   "), None);
+        assert_eq!(clean_name("..."), None);
     }
 }

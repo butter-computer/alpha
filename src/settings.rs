@@ -46,13 +46,15 @@ pub struct Settings {
     pub theme: ThemeMode,
     pub font_size: f32,
     pub font: FontChoice,
+    /// Interface sounds (see `sound.rs`).
+    pub sounds: bool,
 }
 
 impl Global for Settings {}
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: ThemeMode::System, font_size: DEFAULT_FONT_SIZE, font: FontChoice::Serif }
+        Self { theme: ThemeMode::System, font_size: DEFAULT_FONT_SIZE, font: FontChoice::Serif, sounds: true }
     }
 }
 
@@ -108,11 +110,12 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.theme, ThemeMode::System);
         assert_eq!(s.font, FontChoice::Serif);
+        assert!(s.sounds);
     }
 
     #[test]
     fn roundtrip() {
-        let s = Settings { theme: ThemeMode::Dark, font_size: 22.0, font: FontChoice::Mono };
+        let s = Settings { theme: ThemeMode::Dark, font_size: 22.0, font: FontChoice::Mono, sounds: false };
         let json = serde_json::to_string(&s).unwrap();
         assert_eq!(Settings::from_json(&json), s);
     }

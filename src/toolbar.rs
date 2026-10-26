@@ -1,5 +1,7 @@
-//! The bottom toolbar: counts, file name, and the Search / Export / Settings buttons.
+//! The bottom toolbar: counts, file name (click to rename), and the Search /
+//! Export / Settings buttons.
 
+use crate::actions::{Cancel, Confirm};
 use crate::stats;
 use crate::theme::Theme;
 use crate::workspace::Workspace;
@@ -58,9 +60,33 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(px(6.))
-                .child(match notice {
-                    Some(n) => div().text_color(theme.accent).child(n),
-                    None => div().text_color(theme.fg.opacity(0.75)).child(name),
+                .child(match (notice, ws.renaming.clone()) {
+                    (_, Some(input)) => {
+                        // Grows with the name as it is typed.
+                        let len = input.read(cx).content.chars().count() as f32;
+                        div()
+                            .w(px((len * 7. + 14.).clamp(60., 280.)))
+                            .px(px(6.))
+                            .rounded(px(5.))
+                            .bg(theme.hover)
+                            .text_color(theme.fg)
+                            .on_action(cx.listener(|ws, _: &Confirm, window, cx| ws.confirm_rename(window, cx)))
+                            .on_action(cx.listener(|ws, _: &Cancel, window, cx| ws.cancel_rename(window, cx)))
+                            .child(input)
+                            .into_any_element()
+                    }
+                    (Some(n), None) => div().text_color(theme.accent).child(n).into_any_element(),
+                    (None, None) => div()
+                        .id("tb-name")
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(5.))
+                        .cursor_pointer()
+                        .text_color(theme.fg.opacity(0.75))
+                        .hover(move |d| d.bg(theme.hover).text_color(theme.fg))
+                        .on_click(cx.listener(|ws, _, window, cx| ws.start_rename(window, cx)))
+                        .child(name)
+                        .into_any_element(),
                 })
                 .child(
                     div()

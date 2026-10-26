@@ -11,6 +11,7 @@ use crate::conceal::{self, LineView, Reveal};
 use crate::markdown::{self, Analysis, CodeRole, Continuation, Lead, LineKind};
 use crate::shortcuts;
 use crate::slash;
+use crate::sound::Cue;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -39,6 +40,8 @@ pub struct Model {
     pub views_gen: u64,
     pub reveal: Option<Reveal>,
     pub slash: Option<Slash>,
+    /// The construct the last keystroke registered, for the shell to sound.
+    pub cue: Option<Cue>,
     /// Start of the caret's line when the decorations were last computed.
     caret_line_start: usize,
     /// The document contains fence characters, so the caret's line can change decorations.
@@ -60,6 +63,7 @@ impl Model {
             views_gen: 0,
             reveal: None,
             slash: None,
+            cue: None,
             caret_line_start: 0,
             fence_sensitive: false,
         };
@@ -308,7 +312,9 @@ impl Model {
     /// the marked text / selection) and applies typing shortcuts for one character.
     pub fn replace_text(&mut self, range: Option<Range<usize>>, text: &str) {
         let range = range.or(self.marked.clone()).unwrap_or(self.selection.clone());
+        let before = (self.selection.is_empty() && self.marked.is_none()).then(|| self.constructs_at(self.cursor()));
         self.edit(range, text, EditKind::Typed);
+        self.cue = None;
         if text.chars().count() == 1 {
             let c = self.cursor();
             let in_code = self.analysis.lines[self.analysis.line_at(c)].kind == LineKind::Code;
@@ -318,6 +324,9 @@ impl Model {
                 self.slash = Some(Slash { start: c - 1, selected: 0 });
                 self.sync_slash();
             }
+        }
+        if let Some(before) = before {
+            self.cue = registered(&before, &self.constructs_at(self.cursor()));
         }
     }
 
@@ -453,6 +462,7 @@ impl Model {
         if self.selection.is_empty() {
             if let Some((ins, off)) = self.fence_autoclose(c) {
                 self.edit_caret(c..c, &ins, Some(c + off), EditKind::Typed);
+                self.cue = Some(Cue::Code);
                 return;
             }
             if line.code.is_none()
@@ -467,6 +477,7 @@ impl Model {
                     }
                     Continuation::Continue(prefix) => {
                         self.insert(&format!("\n{prefix}"));
+                        self.cue = Some(Cue::Item);
                         return;
                     }
                     Continuation::Clear => {}
@@ -551,6 +562,7 @@ impl Model {
         if let Some(Lead::Task { bracket, checked, .. }) = lead {
             let c = self.cursor();
             self.edit_caret(bracket.start + 1..bracket.start + 2, if checked { " " } else { "x" }, Some(c), EditKind::Typed);
+            self.cue = Some(if checked { Cue::Uncheck } else { Cue::Check });
         }
     }
 
@@ -625,8 +637,80 @@ impl Model {
         let end = self.selection.end;
         let (text, caret) = slash::replacement(item.block, self.text(), start);
         self.slash = None;
+        let before = self.constructs_at(start);
         self.edit_caret(start..end, &text, Some(start + caret), EditKind::Typed);
+        // A divider leaves the caret on the line below it.
+        self.cue = registered(&before, &self.constructs_at(self.cursor())).or_else(|| registered(&before, &self.constructs_at(start)));
     }
+
+    // ---- sounds -------------------------------------------------------------
+
+    /// The constructs on the line containing `offset`.
+    fn constructs_at(&self, offset: usize) -> Constructs {
+        let a = &self.analysis;
+        let line = &a.lines[a.line_at(offset.min(self.buffer.len()))];
+        let block = if line.code.is_some() {
+            Some(Block::Code)
+        } else {
+            line.lead.as_ref().map(|lead| match lead {
+                Lead::Heading { .. } => Block::Heading(match line.kind {
+                    LineKind::Heading(n) => n,
+                    _ => 0,
+                }),
+                Lead::Bullet { .. } | Lead::Ordered { .. } => Block::List,
+                Lead::Task { .. } => Block::Task,
+                Lead::Quote { .. } => Block::Quote,
+                Lead::Rule => Block::Rule,
+                Lead::Fence => Block::Code,
+            })
+        };
+        let mut seen: Vec<usize> = line.delims.iter().map(|(_, i)| *i).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let mut inlines: Vec<String> = seen.iter().map(|i| self.text()[a.inlines[*i].open.clone()].to_string()).collect();
+        inlines.sort_unstable();
+        Constructs { block, inlines }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Block {
+    Heading(u8),
+    List,
+    Task,
+    Quote,
+    Rule,
+    Code,
+}
+
+/// What a line holds: its block kind and the opening delimiter of each inline span.
+struct Constructs {
+    block: Option<Block>,
+    inlines: Vec<String>,
+}
+
+/// The cue for whatever `after` holds that `before` did not: a new block kind,
+/// else an inline span of a kind there were fewer of.
+fn registered(before: &Constructs, after: &Constructs) -> Option<Cue> {
+    if let Some(b) = after.block
+        && after.block != before.block
+    {
+        return Some(match b {
+            Block::Heading(_) => Cue::Heading,
+            Block::Code => Cue::Code,
+            Block::List | Block::Task | Block::Quote | Block::Rule => Cue::Block,
+        });
+    }
+    let mut rest = before.inlines.clone();
+    for d in &after.inlines {
+        match rest.iter().position(|r| r == d) {
+            Some(i) => {
+                rest.remove(i);
+            }
+            None => return Some(Cue::Inline),
+        }
+    }
+    None
 }
 
 fn has_fence_chars(text: &str) -> bool {

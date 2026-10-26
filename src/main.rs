@@ -14,6 +14,7 @@ mod search;
 mod shortcuts;
 mod slash;
 mod settings;
+mod sound;
 mod stats;
 mod theme;
 mod toolbar;

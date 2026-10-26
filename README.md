@@ -20,6 +20,7 @@ not notarized yet, so the first open needs system settings > privacy & security 
 - cmd+k for commands, `/` for blocks
 - search, and export to md or html
 - follows light/dark
+- sounds when a heading, list, inline style or code block registers ([cuelume](https://cuelume.dev) cues), switch off in settings
 
 ## build it yourself
 
