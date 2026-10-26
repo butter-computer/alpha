@@ -109,7 +109,7 @@ impl Element for EditorElement {
     ) {
         let theme = *cx.global::<Theme>();
         let settings = cx.global::<Settings>().clone();
-        let (focus, selection, caret, marked, empty, matches, current) = {
+        let (focus, selection, caret, marked, empty, matches, current, placeholder) = {
             let ed = self.editor.read(cx);
             (
                 ed.focus_handle.clone(),
@@ -119,6 +119,7 @@ impl Element for EditorElement {
                 ed.buffer.is_empty(),
                 ed.find.matches.clone(),
                 ed.find.current,
+                ed.placeholder,
             )
         };
         let _ = marked;
@@ -221,13 +222,12 @@ impl Element for EditorElement {
         // Placeholder.
         if empty {
             let m = metrics(LineKind::Normal, settings.font_size, true);
-            let mut f = gpui::font(settings.font.family());
-            f.style = gpui::FontStyle::Italic;
-            let text: gpui::SharedString = "Start writing…".into();
+            let f = gpui::font(settings.font.family());
+            let text: gpui::SharedString = placeholder.into();
             let run = TextRun {
                 len: text.len(),
                 font: f,
-                color: theme.muted.opacity(0.8),
+                color: theme.muted,
                 background_color: None,
                 underline: None,
                 strikethrough: None,

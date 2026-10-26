@@ -7,6 +7,7 @@ mod fuzzy;
 mod input;
 mod markdown;
 mod palette;
+mod placeholders;
 mod search;
 mod settings;
 mod stats;

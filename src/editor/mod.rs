@@ -60,6 +60,7 @@ pub struct Editor {
     pub path: Option<PathBuf>,
     saved_revision: u64,
     pub find: Find,
+    pub placeholder: &'static str,
 }
 
 impl Focusable for Editor {
@@ -89,6 +90,7 @@ impl Editor {
             path,
             saved_revision,
             find: Find::default(),
+            placeholder: crate::placeholders::random(),
         }
     }
 
@@ -119,6 +121,7 @@ impl Editor {
         self.reversed = false;
         self.marked = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
+        self.placeholder = crate::placeholders::random();
         self.after_edit(cx);
     }
 
