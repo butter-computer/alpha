@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 pub const MIN_FONT_SIZE: f32 = 12.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
-pub const DEFAULT_FONT_SIZE: f32 = 20.0;
+pub const DEFAULT_FONT_SIZE: f32 = 16.0;
 
 pub use crate::fonts::SERIF_FAMILY;
 pub const SANS_FAMILY: &str = "Helvetica Neue";
