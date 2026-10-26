@@ -96,7 +96,6 @@ pub fn build(
 }
 
 fn runs_for_line(line: &markdown::Line, base_family: &'static str, theme: &Theme, active: bool, choice: FontChoice) -> Vec<TextRun> {
-    let heading = matches!(line.kind, LineKind::Heading(_));
     let in_code = line.kind == LineKind::Code;
     line.segments()
         .into_iter()
@@ -104,8 +103,8 @@ fn runs_for_line(line: &markdown::Line, base_family: &'static str, theme: &Theme
             let mono = in_code || flags & markdown::CODE != 0;
             let family = if mono && choice != FontChoice::Mono { MONO_FAMILY } else { base_family };
             let mut f: Font = font(family);
-            if (flags & markdown::BOLD != 0 || heading) && !mono {
-                f.weight = FontWeight::BOLD;
+            if flags & markdown::BOLD != 0 && !mono {
+                f.weight = FontWeight::MEDIUM;
             }
             if flags & markdown::ITALIC != 0 {
                 f.style = FontStyle::Italic;
