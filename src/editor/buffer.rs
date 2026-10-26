@@ -162,6 +162,32 @@ impl Buffer {
         self.text.len()
     }
 
+    /// The run of same-class characters (word or punctuation) around `offset`.
+    pub fn word_range(&self, offset: usize) -> Range<usize> {
+        let before = self.text[..offset].chars().next_back();
+        let after = self.text[offset..].chars().next();
+        let class = match (after, before) {
+            (Some(c), _) if !c.is_whitespace() => word_class(c),
+            (_, Some(c)) if !c.is_whitespace() => word_class(c),
+            _ => return offset..offset,
+        };
+        let start = self.text[..offset]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| !c.is_whitespace() && word_class(*c) == class)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(offset);
+        let end = offset
+            + self.text[offset..]
+                .char_indices()
+                .take_while(|(_, c)| !c.is_whitespace() && word_class(*c) == class)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+        start..end
+    }
+
     /// Start of the logical line containing `offset`.
     pub fn line_start(&self, offset: usize) -> usize {
         self.text[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0)
@@ -236,6 +262,16 @@ mod tests {
         assert_eq!(b.prev_word(15), 7);
         assert_eq!(b.prev_word(7), 0);
         assert_eq!(b.prev_word(0), 0);
+    }
+
+    #[test]
+    fn word_ranges() {
+        let b = Buffer::new("foo bar, baz");
+        assert_eq!(b.word_range(1), 0..3);
+        assert_eq!(b.word_range(3), 0..3);
+        assert_eq!(b.word_range(4), 4..7);
+        assert_eq!(b.word_range(7), 7..8);
+        assert_eq!(b.word_range(8), 7..8);
     }
 
     #[test]

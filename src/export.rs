@@ -20,7 +20,7 @@ pub fn markdown_to_html(md: &str, title: &str) -> String {
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
 <title>{}</title>\n<style>{}</style>\n</head>\n<body>\n<article>\n{}</article>\n</body>\n</html>\n",
         escape(title),
-        CSS,
+        CSS_TEMPLATE.replace("{FAMILY}", crate::fonts::SERIF_FAMILY),
         markdown_to_html_fragment(md)
     )
 }
@@ -29,8 +29,8 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-const CSS: &str = "body{margin:0;background:#fbfaf7;color:#262626}\
-article{max-width:680px;margin:0 auto;padding:64px 24px;font:18px/1.65 Newsreader,Georgia,serif}\
+const CSS_TEMPLATE: &str = "body{margin:0;background:#fbfaf7;color:#262626}\
+article{max-width:680px;margin:0 auto;padding:64px 24px;font:18px/1.65 {FAMILY},Georgia,serif}\
 h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.6em 0 .5em}\
 a{color:#8a4b2a}code{font:.88em ui-monospace,Menlo,monospace;background:#0000000d;padding:.1em .3em;border-radius:4px}\
 pre{background:#0000000a;padding:14px 16px;border-radius:6px;overflow:auto}pre code{background:none;padding:0}\
