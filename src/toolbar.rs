@@ -47,8 +47,6 @@ pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
         .flex()
         .items_center()
         .px(px(16.))
-        .border_t_1()
-        .border_color(theme.hairline)
         .font_family(".SystemUIFont")
         .text_size(px(12.))
         .text_color(theme.muted)

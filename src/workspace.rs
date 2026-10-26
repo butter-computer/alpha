@@ -17,6 +17,13 @@ use gpui::{
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Height of the blur band at the top of the window.
+const TOP_BLUR: f64 = 48.0;
+/// Height of the blur band just above the toolbar.
+const BOTTOM_BLUR: f64 = 32.0;
+/// Overlay panels sit this far above the window bottom so they clear the bottom band.
+const PANEL_BOTTOM: f32 = toolbar::HEIGHT + BOTTOM_BLUR as f32 + 8.0;
+
 pub struct Workspace {
     pub editor: Entity<Editor>,
     palette: Option<Entity<Palette>>,
@@ -25,6 +32,7 @@ pub struct Workspace {
     export_open: bool,
     pub notice: Option<SharedString>,
     notice_gen: u64,
+    edge_blur: Option<crate::edge_blur::EdgeBlur>,
     last_title: String,
     _subs: Vec<Subscription>,
 }
@@ -56,6 +64,7 @@ impl Workspace {
             export_open: false,
             notice: None,
             notice_gen: 0,
+            edge_blur: crate::edge_blur::EdgeBlur::install(window, TOP_BLUR, toolbar::HEIGHT as f64, BOTTOM_BLUR),
             last_title: String::new(),
             _subs: subs,
         };
@@ -71,7 +80,11 @@ impl Workspace {
             ThemeMode::Dark => true,
             ThemeMode::System => matches!(window.appearance(), WindowAppearance::Dark | WindowAppearance::VibrantDark),
         };
-        cx.set_global(if dark { Theme::dark() } else { Theme::light() });
+        let theme = if dark { Theme::dark() } else { Theme::light() };
+        cx.set_global(theme);
+        if let Some(b) = &self.edge_blur {
+            b.set_theme(&theme);
+        }
         window.refresh();
         cx.notify();
     }
@@ -379,7 +392,7 @@ impl Workspace {
         let f = settings.font;
         div()
             .absolute()
-            .bottom(px(toolbar::HEIGHT + 10.))
+            .bottom(px(PANEL_BOTTOM))
             .right(px(16.))
             .w(px(250.))
             .occlude()
@@ -446,7 +459,7 @@ impl Workspace {
         };
         div()
             .absolute()
-            .bottom(px(toolbar::HEIGHT + 10.))
+            .bottom(px(PANEL_BOTTOM))
             .right(px(96.))
             .w(px(190.))
             .occlude()
@@ -491,6 +504,9 @@ impl Focusable for Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_title(window, cx);
+        if let Some(b) = &self.edge_blur {
+            b.layout();
+        }
         let theme = *cx.global::<Theme>();
         let settings = cx.global::<Settings>().clone();
         let root: Div = div();

@@ -1,5 +1,6 @@
 mod actions;
 mod conceal;
+mod edge_blur;
 mod editor;
 mod export;
 mod findbar;

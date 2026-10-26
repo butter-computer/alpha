@@ -64,7 +64,7 @@ impl Render for FindBar {
         };
         div()
             .absolute()
-            .top(px(14.))
+            .top(px(60.))
             .right(px(20.))
             .w(px(280.))
             .occlude()

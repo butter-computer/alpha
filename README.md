@@ -62,6 +62,14 @@ markdown, so files save and load as real `.md`.
 - `src/fonts.rs` bundled default serif (EB Garamond, OFL; see `assets/fonts/OFL.txt`)
 - `toolbar.rs`, `palette.rs`, `findbar.rs`, `settings.rs`, `theme.rs`, `export.rs`, `workspace.rs`
 
+## Edge blur (macOS)
+
+`src/edge_blur.rs` adds two native `NSVisualEffectView`s (blending `withinWindow`, theme-matched appearance, gradient-masked
+with a background tint) over the content: one at the top edge and one just above the toolbar, so scrolling text fades and
+blurs out instead of being clipped. Native views sit above everything GPUI draws, so the bottom band ends at the solid toolbar
+and popups/panels are positioned clear of both bands. Not yet verified visually; if `withinWindow` blending does not pick up
+GPUI's Metal layer, the tint still gives a progressive fade, and the fallback is a Metal blur pass in a patched gpui renderer.
+
 ## Known gaps
 
 No images or tables. Wrapped list lines don't get a hanging indent.
