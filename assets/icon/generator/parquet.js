@@ -5,8 +5,8 @@ function projectTable(x, y) {
 }
 
 function drawParquet() {
-  const satin = ["#c5a16d", "#b99662", "#cfad77", "#b88f5e"];
-  const rose = ["#784b3b", "#6d4336", "#825140", "#734739"];
+  const satin = (window.PARQUET && PARQUET.satin) || ["#c5a16d", "#b99662", "#cfad77", "#b88f5e"]; // PARQUET overrides: playground palettes
+  const rose = (window.PARQUET && PARQUET.rose) || ["#784b3b", "#6d4336", "#825140", "#734739"];
 
   for (let y = -9; y <= 25; y++) {
     const d = y + 14;

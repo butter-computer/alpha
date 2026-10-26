@@ -1,54 +1,74 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Alpha icon · variant 2 playground</title>
+<title>Alpha icon playground</title>
 <style>
   :root{color-scheme:dark}
-  body{margin:0;background:#30241e;color:#d9c3a0;font:13px/1.4 -apple-system,Helvetica,sans-serif;display:flex;min-height:100vh}
-  aside{width:290px;height:100vh;overflow:auto;position:sticky;top:0;padding:26px 22px;background:#271d18;border-right:1px solid #1c1411;flex:none;box-sizing:border-box}
-  h1{font:500 20px Georgia,serif;color:#ead6a8;margin:0 0 4px}.sub{color:#a58a69;margin:0 0 22px}
-  label{display:block;margin:14px 0 5px;color:#a58a69;font-size:11px;letter-spacing:.08em;text-transform:uppercase}
-  label b{float:right;color:#d9c3a0;font-weight:500;letter-spacing:0}
-  select,input[type=text]{width:100%;box-sizing:border-box;background:#3a2b24;color:#ead6a8;border:1px solid #1c1411;border-radius:8px;padding:8px 10px;font:inherit}
-  input[type=range]{width:100%;accent-color:#c5a16d}.row{display:flex;gap:8px}.row>*{flex:1}
-  button{background:#c5a16d;color:#2a1d18;border:0;border-radius:8px;padding:9px 12px;font:600 13px inherit;cursor:pointer}
-  button.ghost{background:#3a2b24;color:#d9c3a0}.btns{display:flex;gap:8px;margin-top:22px}
-  .chk{display:flex;gap:8px;align-items:center;margin-top:16px;color:#d9c3a0;font-size:13px;text-transform:none;letter-spacing:0}
-  main{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:24px}
-  #out{width:min(560px,calc(100vw - 360px),80vh);height:auto;aspect-ratio:1}
-  .small{display:flex;gap:24px;align-items:center}.small span{font-size:11px;color:#8a7258;letter-spacing:.06em}
-  #status{color:#a58a69;font-size:12px;min-height:1em}
+  *{box-sizing:border-box}
+  body{margin:0;background:#30241e;color:#d9c3a0;font:12px/1.35 -apple-system,Helvetica,sans-serif;display:flex;height:100vh;overflow:hidden}
+  aside{width:340px;flex:none;background:#271d18;border-right:1px solid #1c1411;display:flex;flex-direction:column;min-height:0}
+  .head{padding:16px 16px 10px}h1{font:500 18px Georgia,serif;color:#ead6a8;margin:0 0 2px}.sub{color:#8a7258;margin:0}
+  #groups{overflow:auto;flex:1;padding:0 10px 18px}
+  details{border-top:1px solid #1c1411;padding:2px 6px}summary{cursor:pointer;padding:8px 2px;font-weight:600;color:#ead6a8;letter-spacing:.02em}
+  .body{padding:2px 0 10px}
+  .row{display:grid;grid-template-columns:118px 1fr auto;gap:8px;align-items:center;margin:5px 0}
+  .row label{color:#a58a69}.row.wide{grid-template-columns:1fr auto}
+  .row code{color:#d9c3a0;font:11px ui-monospace,Menlo,monospace;min-width:38px;text-align:right}
+  .row input[type=checkbox]{justify-self:start}
+  input[type=range]{width:100%;accent-color:#c5a16d;height:14px;margin:0}
+  input[type=color]{width:100%;height:22px;padding:0;border:1px solid #1c1411;border-radius:5px;background:none}
+  select,input[type=text],textarea{width:100%;background:#3a2b24;color:#ead6a8;border:1px solid #1c1411;border-radius:6px;padding:5px 7px;font:inherit}
+  textarea{font:10.5px ui-monospace,Menlo,monospace;resize:vertical}
+  button{background:#c5a16d;color:#2a1d18;border:0;border-radius:6px;padding:6px 10px;font:600 12px inherit;cursor:pointer;white-space:nowrap}
+  button.ghost{background:#3a2b24;color:#d9c3a0}button:active{transform:translateY(1px)}
+  .btns{display:flex;gap:6px;margin:6px 0}.btns>*{flex:1}
+  .note{color:#8a7258;margin:8px 0 4px}pre{margin:0;background:#1e1612;padding:7px;border-radius:6px;font:10.5px ui-monospace,Menlo,monospace;white-space:pre-wrap;color:#c5a16d;user-select:all}
+  main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .bar{display:flex;gap:8px;align-items:center;padding:12px 18px;border-bottom:1px solid #1c1411;background:#2a2019}
+  .bar .sp{flex:1}.seg{display:flex;border-radius:6px;overflow:hidden}.seg button{border-radius:0;background:#3a2b24;color:#d9c3a0}.seg button.on{background:#c5a16d;color:#2a1d18}
+  #status{color:#8a7258;margin-left:6px}
+  #stage{flex:1;display:flex;align-items:center;justify-content:center;gap:34px;padding:24px;min-height:0;transition:background .2s}
+  #stage[data-bd=dark]{background:#1d1a19}#stage[data-bd=light]{background:#e9e5df}
+  #out{width:min(620px,calc(100vw - 580px),calc(100vh - 170px));height:auto;flex:none}
+  .smalls{display:flex;flex-direction:column;gap:22px;align-items:center}
+  .smalls .cap{font-size:10px;letter-spacing:.08em;color:#8a7258}#stage[data-bd=light] .cap{color:#6d6256}
+  @media (max-width:860px){
+    body{flex-direction:column-reverse;height:auto;overflow:auto;min-height:100vh}
+    aside{width:100%;border-right:0}#groups{overflow:visible}
+    main{position:sticky;top:0;z-index:5;background:#30241e;box-shadow:0 6px 18px rgba(0,0,0,.4)}
+    .bar{padding:8px 10px;flex-wrap:wrap}
+    #stage{padding:10px;gap:16px}#out{width:min(46vw,38vh)}
+    .smalls{gap:6px}.smalls .cap{display:none}
+  }
   canvas:not(#out){position:absolute;left:-99999px;top:0}
-  .hint{margin-top:18px;color:#7a6550;font-size:11px}
 </style>
 <aside>
-  <h1>Variant 2 playground</h1><p class="sub">Rosewood oval · pick a letterform</p>
-  <label>Font</label><select id="font"></select>
-  <div class="row"><div><label>Weight</label><select id="weight"></select></div><div><label>Letter</label><input id="char" type="text" value="a" maxlength="1"></div></div>
-  <label>Centering</label>
-  <select id="center"><option value="blend">Optical (blend)</option><option value="centroid">Visual mass (centroid)</option><option value="bbox">Bounding box</option></select>
-  <label>Size <b id="size-v">560</b></label><input id="size" type="range" min="360" max="760" value="560">
-  <label>Nudge X <b id="dx-v">0</b></label><input id="dx" type="range" min="-80" max="80" value="0">
-  <label>Nudge Y <b id="dy-v">0</b></label><input id="dy" type="range" min="-80" max="80" value="0">
-  <label>Grain angle <b id="angle-v">83</b></label><input id="angle" type="range" min="-90" max="90" value="83">
-  <label>Grain seed <b id="seed-v">41</b></label><input id="seed" type="range" min="1" max="99" value="41">
-  <label class="chk"><input id="ring" type="checkbox" checked> Banded oval ring</label>
-  <div class="btns"><button id="dl">Download PNG</button><button id="reset" class="ghost">Reset</button></div>
-  <div class="hint">↑ / ↓ cycles fonts. Each render takes a few seconds.</div>
+  <div class="head"><h1>Icon playground</h1><p class="sub">Marquetry veneer · every element is a knob</p></div>
+  <div id="groups"></div>
 </aside>
 <main>
-  <canvas id="out" width="1024" height="1024"></canvas>
-  <div class="small"><img id="p128" width="128"><img id="p64" width="64"><img id="p32" width="32"><span>128 · 64 · 32</span></div>
-  <div id="status">starting…</div>
+  <div class="bar">
+    <button id="dl">Download PNG 1024</button><button id="reset" class="ghost">Reset</button><span id="status">starting…</span>
+    <span class="sp"></span><span style="color:#8a7258">Backdrop</span>
+    <div class="seg"><button data-bd="dark" class="on">Dark Dock</button><button data-bd="light">Light Dock</button></div>
+  </div>
+  <div id="stage" data-bd="dark">
+    <canvas id="out" width="1024" height="1024"></canvas>
+    <div class="smalls"><img id="p128" width="128" height="128"><div class="cap">128</div><img id="p64" width="64" height="64"><div class="cap">64</div><img id="p32" width="32" height="32"><div class="cap">32</div></div>
+  </div>
 </main>
 <script src="https://cdn.jsdelivr.net/npm/p5@2.3.4/lib/p5.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/p5.brush@2.2.3/dist/p5.brush.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/polygon-clipping@0.15.7/dist/polygon-clipping.umd.min.js"></script>
 <script>
 (() => {
+  // Seeded PRNG for the art (same preamble as the sketch); UI-only randomness is drawn before it is installed.
+  window.__uiRandom = Math.random;
   let t = (1517673520 >>> 0);
   Math.random = () => { t += 0x6D2B79F5; let r = Math.imul(t ^ (t >>> 15), 1 | t); r ^= r + Math.imul(r ^ (r >>> 7), 61 | r); return ((r ^ (r >>> 14)) >>> 0) / 4294967296; };
 })();
 </script>
+<script src="parquet.js"></script>
 <script src="helpers.js"></script>
 <script src="inlay.js"></script>
 <script src="interactive.js"></script>
