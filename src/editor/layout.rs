@@ -101,9 +101,9 @@ fn runs_for_view(view: &LineView, base_family: &'static str, theme: &Theme, choi
             let mono = (in_code || flags & markdown::CODE != 0) && flags & markdown::PREFIX == 0;
             let family = if mono && choice != FontChoice::Mono { MONO_FAMILY } else { base_family };
             let mut f: Font = font(family);
-            // Never bolder than Medium; headings are regular weight.
+            // Strong spans use SemiBold (never Bold); headings are regular weight.
             if flags & markdown::BOLD != 0 && !mono {
-                f.weight = FontWeight::MEDIUM;
+                f.weight = FontWeight::SEMIBOLD;
             }
             if flags & markdown::ITALIC != 0 {
                 f.style = FontStyle::Italic;
