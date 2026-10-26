@@ -2,7 +2,7 @@
 //! logical line, built from the concealed *display* text of each line.
 
 use crate::conceal::LineView;
-use crate::markdown::{self, LineKind};
+use crate::markdown::{self, CodeRole, LineKind};
 use crate::settings::{FontChoice, MONO_FAMILY, Settings};
 use crate::theme::Theme;
 use gpui::{
@@ -25,6 +25,21 @@ pub struct LineLayout {
     pub font_size: Pixels,
     /// `None` when the display text is empty.
     pub wrapped: Option<WrappedLine>,
+}
+
+/// Outer margin of a code panel, and its inner padding.
+pub const PANEL_MARGIN: f32 = 6.;
+pub const PANEL_PAD: f32 = 12.;
+/// Extra room under a concealed opening fence for the language label.
+pub const PANEL_LABEL: f32 = 12.;
+
+/// Height of a concealed fence row: the panel's margin plus its padding (and
+/// label room), so the fence takes no more space than the panel's own padding.
+fn hidden_fence_height(view: &LineView) -> f32 {
+    match view.code.as_ref().map(|c| &c.role) {
+        Some(CodeRole::Open { lang }) if !lang.is_empty() => PANEL_MARGIN + PANEL_PAD + PANEL_LABEL,
+        _ => PANEL_MARGIN + PANEL_PAD,
+    }
 }
 
 pub struct Layout {
@@ -64,7 +79,11 @@ pub fn build(window: &mut Window, views: Rc<Vec<LineView>>, text_len: usize, set
     let mut y = px(0.);
     let mut lines = Vec::with_capacity(views.len());
     for (i, view) in views.iter().enumerate() {
-        let m = metrics(view.kind, settings.font_size, i == 0);
+        let mut m = metrics(view.kind, settings.font_size, i == 0);
+        if view.fence_hidden {
+            let h = px(hidden_fence_height(view));
+            m = Metrics { font_size: m.font_size, line_height: h, pad_top: px(0.) };
+        }
         let wrapped = if view.display.is_empty() {
             None
         } else {
@@ -130,7 +149,7 @@ fn runs_for_view(view: &LineView, base_family: &'static str, theme: &Theme, choi
                 len,
                 font: f,
                 color,
-                background_color: (flags & markdown::CODE != 0 && !in_code).then_some(theme.code_bg),
+                background_color: None,
                 underline: (flags & markdown::LINK != 0).then(|| UnderlineStyle {
                     color: Some(theme.accent.opacity(0.5)),
                     thickness: px(1.),
@@ -203,8 +222,17 @@ impl Layout {
     pub fn rects_for_range(&self, i: usize, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         let line = &self.lines[i];
         let view = &self.views[i];
-        let mut out = Vec::new();
         let includes_newline = range.end > line.end && range.start <= line.end;
+        let a = view.buf_to_disp(range.start.max(line.start));
+        let b = view.buf_to_disp(range.end.min(line.end));
+        self.rects_for_disp(i, a..b, includes_newline)
+    }
+
+    /// Rectangles (one per wrapped row) for a display range on line `i`.
+    pub fn rects_for_disp(&self, i: usize, disp: Range<usize>, includes_newline: bool) -> Vec<Bounds<Pixels>> {
+        let line = &self.lines[i];
+        let view = &self.views[i];
+        let mut out = Vec::new();
         let nl_extra = px(6.);
         let Some(w) = &line.wrapped else {
             if includes_newline {
@@ -216,8 +244,7 @@ impl Layout {
         let mut starts = vec![0usize];
         starts.extend(w.wrap_boundaries.iter().map(|b| ul.runs[b.run_ix].glyphs[b.glyph_ix].index));
         let len = view.display.len();
-        let a = view.buf_to_disp(range.start.max(line.start));
-        let b = view.buf_to_disp(range.end.min(line.end));
+        let (a, b) = (disp.start, disp.end);
         for (row, &row_start) in starts.iter().enumerate() {
             let row_end = starts.get(row + 1).copied().unwrap_or(len);
             let last_row = row + 1 == starts.len();

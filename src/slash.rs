@@ -1,7 +1,6 @@
 //! The `/` block menu.
 
 use crate::fuzzy;
-use crate::shortcuts::prev_line_nonblank;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Block {
@@ -35,6 +34,12 @@ pub const ITEMS: &[Item] = &[
     Item { label: "Code block", hint: "```", block: Block::Code },
     Item { label: "Divider", hint: "---", block: Block::Divider },
 ];
+
+/// Whether the line above `ls` has content (a divider typed right under it
+/// would otherwise read as a setext underline in exported HTML).
+fn prev_line_nonblank(text: &str, ls: usize) -> bool {
+    ls > 0 && text[..ls - 1].rsplit('\n').next().is_some_and(|l| !l.trim().is_empty())
+}
 
 pub fn filter(query: &str) -> Vec<&'static Item> {
     fuzzy::filter(query, ITEMS, |i| i.label)

@@ -11,7 +11,7 @@
 //! range) maps to the buffer offset *after* the concealed range, and the caret
 //! can never sit inside a line's decoration prefix.
 
-use crate::markdown::{Analysis, DONE, Lead, Line, LineKind, PREFIX};
+use crate::markdown::{Analysis, CODE, CodeLine, DONE, Lead, Line, LineKind, PREFIX};
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,21 +24,21 @@ pub enum SegKind {
     Prefix,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seg {
     pub buf: Range<usize>,
     pub disp: Range<usize>,
     pub kind: SegKind,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkbox {
     /// Placeholder range in the display string (one em space).
     pub disp: Range<usize>,
     pub checked: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineView {
     pub start: usize,
     pub end: usize,
@@ -51,6 +51,12 @@ pub struct LineView {
     /// The caret may not move left of this display offset.
     pub min_disp: usize,
     pub checkbox: Option<Checkbox>,
+    /// Set for lines of a fenced code block.
+    pub code: Option<CodeLine>,
+    /// A fence line that is concealed (the caret is not on it).
+    pub fence_hidden: bool,
+    /// Display ranges of inline code (for the rounded background).
+    pub code_spans: Vec<Range<usize>>,
 }
 
 impl LineView {
@@ -113,17 +119,28 @@ impl LineView {
     }
 }
 
-/// Which markers are currently shown raw.
+/// Which markers are currently shown raw. It names the exact marker range it
+/// revealed, so it can be re-validated against any later text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reveal {
-    /// A block marker on the line starting at `line_start`.
-    Block { line_start: usize },
+    /// The block marker of one line (a divider's marker is its whole line).
+    Block { marker: Range<usize> },
     /// The delimiters of one inline span.
-    Inline { full: Range<usize> },
+    Inline { open: Range<usize>, close: Range<usize> },
 }
 
 impl Reveal {
-    /// Keeps the reveal anchored after an edit (`removed` bytes at `at` replaced by `inserted`).
+    /// Lines the reveal belongs to: a block marker's line, or the lines holding
+    /// the opening and closing delimiters of an inline span.
+    fn lines(&self, a: &Analysis) -> [usize; 2] {
+        match self {
+            Reveal::Block { marker } => [a.line_at(marker.start); 2],
+            Reveal::Inline { open, close } => [a.line_at(open.start), a.line_at(close.start)],
+        }
+    }
+
+    /// Keeps the ranges anchored after an edit (`removed` bytes at `at` replaced by `inserted`).
+    /// Ranges the edit touches shrink or move, so they stop matching and the reveal clears.
     pub fn adjust(&mut self, at: usize, removed: usize, inserted: usize) {
         let shift = |p: usize| {
             if p <= at {
@@ -134,20 +151,26 @@ impl Reveal {
                 at + inserted
             }
         };
+        let map = |r: &mut Range<usize>| *r = shift(r.start)..shift(r.end);
         match self {
-            Reveal::Block { line_start } => *line_start = shift(*line_start),
-            Reveal::Inline { full } => {
-                let (s, e) = (shift(full.start), shift(full.end));
-                *full = s..e.max(s);
+            Reveal::Block { marker } => map(marker),
+            Reveal::Inline { open, close } => {
+                map(open);
+                map(close);
             }
         }
     }
 
-    /// Whether the reveal still applies for a caret at `caret`.
+    /// Whether the reveal still applies: its marker range exists in the current
+    /// analysis and the caret is on its line.
     pub fn is_valid(&self, a: &Analysis, caret: usize) -> bool {
+        let lines = self.lines(a);
+        if !lines.contains(&a.line_at(caret)) {
+            return false;
+        }
         match self {
-            Reveal::Block { line_start } => a.lines[a.line_at(caret)].start == *line_start,
-            Reveal::Inline { full } => full.start <= caret && caret <= full.end,
+            Reveal::Block { marker } => a.lines[lines[0]].marker().as_ref() == Some(marker),
+            Reveal::Inline { open, close } => a.inlines.iter().any(|i| i.open == *open && i.close == *close),
         }
     }
 }
@@ -156,17 +179,18 @@ impl Reveal {
 /// (and deletes nothing); `None` means delete normally.
 pub fn on_backspace(a: &Analysis, caret: usize, current: &Option<Reveal>) -> Option<Reveal> {
     let line = &a.lines[a.line_at(caret)];
-    if let Some(lead) = &line.lead {
-        let already = matches!(current, Some(Reveal::Block { line_start }) if *line_start == line.start);
-        if !already && caret == lead.content_start(line) && (caret > line.start || line.end > line.start) {
-            return Some(Reveal::Block { line_start: line.start });
+    if let (Some(lead), Some(marker)) = (&line.lead, line.marker()) {
+        let already = matches!(current, Some(Reveal::Block { marker: m }) if *m == marker);
+        if !already && caret == lead.content_start(line) && marker.end > marker.start {
+            return Some(Reveal::Block { marker });
         }
     }
     for inl in &a.inlines {
         let at_close = !inl.close.is_empty() && inl.close.end == caret;
         let at_open = !inl.open.is_empty() && inl.open.end == caret;
-        if (at_close || at_open) && !matches!(current, Some(Reveal::Inline { full }) if *full == inl.full) {
-            return Some(Reveal::Inline { full: inl.full.clone() });
+        let already = matches!(current, Some(Reveal::Inline { open, close }) if *open == inl.open && *close == inl.close);
+        if (at_close || at_open) && !already {
+            return Some(Reveal::Inline { open: inl.open.clone(), close: inl.close.clone() });
         }
     }
     None
@@ -183,17 +207,23 @@ fn bullet_glyph(depth: usize) -> &'static str {
     }
 }
 
-pub fn build_views(text: &str, a: &Analysis, reveal: &Option<Reveal>) -> Vec<LineView> {
-    a.lines.iter().map(|l| build_line(text, a, l, reveal)).collect()
+/// The whole decoration state as a pure function of the text, the caret and
+/// the reveal state. A reveal that no longer applies is ignored.
+pub fn build_views(text: &str, a: &Analysis, reveal: &Option<Reveal>, caret: usize) -> Vec<LineView> {
+    let reveal = reveal.as_ref().filter(|r| r.is_valid(a, caret));
+    let caret_line = a.line_at(caret.min(text.len()));
+    a.lines.iter().enumerate().map(|(i, l)| build_line(text, a, l, reveal, i == caret_line)).collect()
 }
 
-fn build_line(text: &str, a: &Analysis, line: &Line, reveal: &Option<Reveal>) -> LineView {
-    let block_revealed = matches!(reveal, Some(Reveal::Block { line_start }) if *line_start == line.start);
+fn build_line(text: &str, a: &Analysis, line: &Line, reveal: Option<&Reveal>, caret_here: bool) -> LineView {
+    let block_revealed = matches!(reveal, Some(Reveal::Block { marker }) if line.marker().as_ref() == Some(marker));
     let revealed_inline = match reveal {
-        Some(Reveal::Inline { full }) => a.inlines.iter().position(|i| i.full == *full),
+        Some(Reveal::Inline { open, close }) => a.inlines.iter().position(|i| i.open == *open && i.close == *close),
         _ => None,
     };
-    let lead = if block_revealed { None } else { line.lead.clone() };
+    // Fence lines show raw only while the caret is on them.
+    let fence_shown = line.is_fence() && caret_here;
+    let lead = if block_revealed || fence_shown { None } else { line.lead.clone() };
     let kind = if block_revealed { LineKind::Normal } else { line.kind };
 
     let mut view = LineView {
@@ -205,6 +235,9 @@ fn build_line(text: &str, a: &Analysis, line: &Line, reveal: &Option<Reveal>) ->
         runs: Vec::new(),
         min_disp: 0,
         checkbox: None,
+        code: line.code.clone(),
+        fence_hidden: false,
+        code_spans: Vec::new(),
     };
 
     let mut pos = line.start;
@@ -214,6 +247,7 @@ fn build_line(text: &str, a: &Analysis, line: &Line, reveal: &Option<Reveal>) ->
             if line.end > line.start {
                 view.segs.push(Seg { buf: line.start..line.end, disp: 0..0, kind: SegKind::Concealed });
             }
+            view.fence_hidden = matches!(lead, Some(Lead::Fence));
             return view;
         }
         Some(Lead::Heading { marker }) | Some(Lead::Quote { marker }) => {
@@ -295,6 +329,16 @@ fn build_line(text: &str, a: &Analysis, line: &Line, reveal: &Option<Reveal>) ->
             _ => view.runs.push((y - x, flags)),
         }
     }
+    let mut at = 0;
+    for &(len, flags) in &view.runs {
+        if flags & CODE != 0 && kind != LineKind::Code {
+            match view.code_spans.last_mut() {
+                Some(r) if r.end == at => r.end = at + len,
+                _ => view.code_spans.push(at..at + len),
+            }
+        }
+        at += len;
+    }
     view
 }
 
@@ -315,8 +359,12 @@ mod tests {
     use super::*;
     use crate::markdown::analyze;
 
+    fn views_at(t: &str, caret: usize) -> Vec<LineView> {
+        build_views(t, &analyze(t, caret), &None, caret)
+    }
+
     fn views(t: &str) -> Vec<LineView> {
-        build_views(t, &analyze(t), &None)
+        views_at(t, t.len())
     }
 
     #[test]
@@ -367,7 +415,7 @@ mod tests {
 
     #[test]
     fn nested_bullets_use_other_glyphs() {
-        let vs = views("- a\n    - b\n        - c");
+        let vs = views("- a\n  - b\n    - c");
         assert!(vs[1].display.starts_with("\u{2003}◦"));
         assert!(vs[2].display.starts_with("\u{2003}\u{2003}▪"));
     }
@@ -382,9 +430,7 @@ mod tests {
 
     #[test]
     fn task_has_checkbox_and_done_style() {
-        let t = "- [x] done";
-        let a = analyze(t);
-        let v = &build_views(t, &a, &None)[0];
+        let v = &views("- [x] done")[0];
         let cb = v.checkbox.as_ref().unwrap();
         assert!(cb.checked);
         assert_eq!(&v.display[cb.disp.clone()], "\u{2003}");
@@ -393,14 +439,42 @@ mod tests {
     }
 
     #[test]
-    fn quote_marker_hidden_fence_and_rule_lines_empty() {
-        let vs = views("> q\n```\nx\n```\n---");
+    fn quote_marker_hidden_rule_line_empty() {
+        let vs = views("> q\n\n---");
         assert_eq!(vs[0].display, "q");
-        assert_eq!(vs[1].display, "");
-        assert_eq!(vs[2].display, "x");
-        assert_eq!(vs[3].display, "");
-        assert_eq!(vs[4].display, "");
-        assert_eq!(vs[1].disp_to_buf(0), vs[1].end);
+        assert_eq!(vs[2].display, "");
+        assert_eq!(vs[2].disp_to_buf(0), vs[2].end);
+    }
+
+    #[test]
+    fn fences_are_hidden_unless_the_caret_is_on_them() {
+        let t = "```rust\ncode\n```";
+        let away = views_at(t, 9);
+        assert_eq!(away[0].display, "");
+        assert!(away[0].fence_hidden && away[2].fence_hidden);
+        assert_eq!(away[1].display, "code");
+        assert_eq!(away[1].kind, LineKind::Code);
+        let on_open = views_at(t, 3);
+        assert_eq!(on_open[0].display, "```rust");
+        assert!(!on_open[0].fence_hidden);
+        assert!(on_open[2].fence_hidden);
+        let on_close = views_at(t, t.len());
+        assert_eq!(on_close[2].display, "```");
+    }
+
+    #[test]
+    fn code_body_gets_no_inline_styling() {
+        let v = &views_at("```\n**x** `y`\n```", 6)[1];
+        assert_eq!(v.display, "**x** `y`");
+        assert!(v.runs.iter().all(|(_, f)| *f == 0));
+        assert!(v.code_spans.is_empty());
+    }
+
+    #[test]
+    fn inline_code_reports_display_ranges() {
+        let v = &views("a `bc` d")[0];
+        assert_eq!(v.display, "a bc d");
+        assert_eq!(v.code_spans, vec![2..4]);
     }
 
     #[test]
@@ -412,34 +486,40 @@ mod tests {
     #[test]
     fn block_reveal_shows_raw_plain_paragraph() {
         let t = "# Title";
-        let a = analyze(t);
-        let v = &build_views(t, &a, &Some(Reveal::Block { line_start: 0 }))[0];
+        let a = analyze(t, 2);
+        let r = Some(Reveal::Block { marker: 0..2 });
+        let v = &build_views(t, &a, &r, 2)[0];
         assert_eq!(v.display, "# Title");
         assert_eq!(v.kind, LineKind::Normal);
+        // a reveal for a marker that is not there is ignored
+        let r = Some(Reveal::Block { marker: 0..1 });
+        assert_eq!(build_views(t, &a, &r, 2)[0].display, "Title");
     }
 
     #[test]
     fn inline_reveal_only_that_span() {
         let t = "**a** and *b*";
-        let a = analyze(t);
-        let full = a.inlines[0].full.clone();
-        let v = &build_views(t, &a, &Some(Reveal::Inline { full }))[0];
+        let a = analyze(t, 5);
+        let r = Some(Reveal::Inline { open: 0..2, close: 3..5 });
+        let v = &build_views(t, &a, &r, 5)[0];
         assert_eq!(v.display, "**a** and b");
     }
 
     #[test]
     fn plain_text_ignores_markers() {
-        let vs = views("# Hi there\n- a **b**\n```\nc\n```\n---");
-        assert_eq!(plain_text(&vs), "Hi there\na b\n\nc\n\n");
+        let t = "# Hi there\n\n- a **b**\n\n```\nc\n```\n\n---";
+        let vs = views_at(t, 0);
+        assert_eq!(plain_text(&vs), "Hi there\n\na b\n\n\nc\n\n\n");
     }
 
     #[test]
     fn backspace_after_block_marker_reveals_instead_of_deleting() {
         let t = "# Title";
-        let a = analyze(t);
-        assert_eq!(on_backspace(&a, 2, &None), Some(Reveal::Block { line_start: 0 }));
+        let a = analyze(t, 2);
+        let m = Reveal::Block { marker: 0..2 };
+        assert_eq!(on_backspace(&a, 2, &None), Some(m.clone()));
         // once revealed, backspace edits normally
-        assert_eq!(on_backspace(&a, 2, &Some(Reveal::Block { line_start: 0 })), None);
+        assert_eq!(on_backspace(&a, 2, &Some(m)), None);
         // elsewhere in the line: normal
         assert_eq!(on_backspace(&a, 4, &None), None);
     }
@@ -447,54 +527,72 @@ mod tests {
     #[test]
     fn backspace_after_bullet_and_checklist_marker_reveals() {
         for t in ["- x", "1. x", "- [ ] x", "> x"] {
-            let a = analyze(t);
+            let a = analyze(t, 0);
             let cs = a.lines[0].lead.as_ref().unwrap().content_start(&a.lines[0]);
-            assert_eq!(on_backspace(&a, cs, &None), Some(Reveal::Block { line_start: 0 }), "{t}");
+            assert_eq!(on_backspace(&a, cs, &None), Some(Reveal::Block { marker: 0..cs }), "{t}");
         }
     }
 
     #[test]
     fn backspace_reveals_empty_marker_only_line() {
-        let a = analyze("# ");
-        assert_eq!(on_backspace(&a, 2, &None), Some(Reveal::Block { line_start: 0 }));
+        let a = analyze("# ", 2);
+        assert_eq!(on_backspace(&a, 2, &None), Some(Reveal::Block { marker: 0..2 }));
+    }
+
+    #[test]
+    fn backspace_on_a_divider_reveals_its_dashes() {
+        let a = analyze("---", 3);
+        assert_eq!(on_backspace(&a, 3, &None), Some(Reveal::Block { marker: 0..3 }));
+    }
+
+    #[test]
+    fn backspace_never_reveals_fences() {
+        let t = "```\n\n```";
+        let a = analyze(t, 3);
+        assert_eq!(on_backspace(&a, 3, &None), None);
     }
 
     #[test]
     fn backspace_after_closing_delimiter_reveals_that_span() {
         let t = "**a** *b*";
-        let a = analyze(t);
-        assert_eq!(on_backspace(&a, 5, &None), Some(Reveal::Inline { full: 0..5 }));
-        assert_eq!(on_backspace(&a, 5, &Some(Reveal::Inline { full: 0..5 })), None);
+        let a = analyze(t, 5);
+        let first = Reveal::Inline { open: 0..2, close: 3..5 };
+        assert_eq!(on_backspace(&a, 5, &None), Some(first.clone()));
+        assert_eq!(on_backspace(&a, 5, &Some(first.clone())), None);
         // the other span is independent
-        assert_eq!(on_backspace(&a, 9, &Some(Reveal::Inline { full: 0..5 })), Some(Reveal::Inline { full: 6..9 }));
+        assert_eq!(on_backspace(&a, 9, &Some(first)), Some(Reveal::Inline { open: 6..7, close: 8..9 }));
         // caret right after an opener also reveals
-        assert_eq!(on_backspace(&a, 2, &None), Some(Reveal::Inline { full: 0..5 }));
+        assert_eq!(on_backspace(&a, 2, &None), Some(Reveal::Inline { open: 0..2, close: 3..5 }));
     }
 
     #[test]
-    fn reveal_validity_follows_the_caret() {
+    fn reveal_validity_follows_the_caret_and_the_marker() {
         let t = "# a\nplain";
-        let a = analyze(t);
-        let r = Reveal::Block { line_start: 0 };
+        let a = analyze(t, 0);
+        let r = Reveal::Block { marker: 0..2 };
         assert!(r.is_valid(&a, 2));
         assert!(r.is_valid(&a, 3));
         assert!(!r.is_valid(&a, 4));
-        let i = Reveal::Inline { full: 0..5 };
-        assert!(i.is_valid(&a, 5));
-        assert!(!i.is_valid(&a, 6));
+        assert!(!Reveal::Block { marker: 0..1 }.is_valid(&a, 2));
+        let t = "**a** b";
+        let a = analyze(t, 0);
+        let i = Reveal::Inline { open: 0..2, close: 3..5 };
+        assert!(i.is_valid(&a, 6));
+        assert!(!Reveal::Inline { open: 0..2, close: 3..6 }.is_valid(&a, 6));
     }
 
     #[test]
     fn reveal_adjusts_for_edits() {
-        let mut r = Reveal::Inline { full: 4..9 };
-        r.adjust(6, 0, 1); // insert inside
-        assert_eq!(r, Reveal::Inline { full: 4..10 });
+        let mut r = Reveal::Inline { open: 4..6, close: 8..10 };
         r.adjust(0, 0, 2); // insert before
-        assert_eq!(r, Reveal::Inline { full: 6..12 });
-        r.adjust(7, 1, 0); // delete inside
-        assert_eq!(r, Reveal::Inline { full: 6..11 });
-        let mut b = Reveal::Block { line_start: 10 };
+        assert_eq!(r, Reveal::Inline { open: 6..8, close: 10..12 });
+        r.adjust(9, 1, 0); // delete between
+        assert_eq!(r, Reveal::Inline { open: 6..8, close: 9..11 });
+        let mut b = Reveal::Block { marker: 10..12 };
         b.adjust(2, 0, 3);
-        assert_eq!(b, Reveal::Block { line_start: 13 });
+        assert_eq!(b, Reveal::Block { marker: 13..15 });
+        // an edit inside the marker changes its range
+        b.adjust(14, 1, 0);
+        assert_eq!(b, Reveal::Block { marker: 13..14 });
     }
 }

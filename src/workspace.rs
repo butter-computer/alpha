@@ -308,7 +308,7 @@ impl Workspace {
     fn save(&mut self, as_new: bool, window: &mut Window, cx: &mut Context<Self>) -> Task<bool> {
         let (text, revision, path) = {
             let e = self.editor.read(cx);
-            (e.text().to_string(), e.buffer.revision(), e.path.clone())
+            (e.text().to_string(), e.buffer().revision(), e.path.clone())
         };
         let path = if as_new { None } else { path };
         let rx = path

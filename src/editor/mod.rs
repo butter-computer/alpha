@@ -1,22 +1,22 @@
-//! The markdown editing surface: buffer, selection, input handling, layout.
+//! The markdown editing surface: a GPUI shell around the headless `Model`.
 //!
-//! The buffer is plain markdown. A conceal layer (`crate::conceal`) hides the
-//! syntax markers; every cursor operation here goes through the per-line
-//! display mapping so concealed text behaves as if it did not exist.
+//! The model owns the buffer, selection, decorations and every key behaviour
+//! (see `model.rs`); this file adds layout-dependent navigation (wrapped lines,
+//! hit-testing), mouse input, IME plumbing and rendering.
 
 pub mod buffer;
 mod element;
 pub mod layout;
+pub mod model;
+#[cfg(test)]
+mod tests;
 
 use crate::actions::*;
-use crate::conceal::{self, LineView, Reveal};
-use crate::markdown::{self, Analysis, Continuation, Lead, LineKind};
 use crate::search;
 use crate::settings::Settings;
-use crate::shortcuts;
 use crate::slash;
 use crate::theme::Theme;
-use buffer::{Buffer, next_grapheme_in, next_word_in, prev_grapheme_in, prev_word_in};
+use buffer::Buffer;
 use element::EditorElement;
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, EntityInputHandler, FocusHandle, Focusable,
@@ -25,6 +25,7 @@ use gpui::{
     UTF16Selection, Window, anchored, deferred, div, point, prelude::*, px,
 };
 use layout::Layout;
+use model::Model;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -37,12 +38,6 @@ pub struct Find {
     pub query: String,
     pub matches: Vec<Range<usize>>,
     pub current: Option<usize>,
-}
-
-/// An open `/` menu: `start` is the buffer offset of the slash.
-pub struct Slash {
-    pub start: usize,
-    pub selected: usize,
 }
 
 #[derive(PartialEq)]
@@ -59,15 +54,7 @@ type LayoutCache = Rc<RefCell<Option<(LayoutKey, Rc<Layout>)>>>;
 
 pub struct Editor {
     pub focus_handle: FocusHandle,
-    pub buffer: Buffer,
-    selection: Range<usize>,
-    reversed: bool,
-    marked: Option<Range<usize>>,
-    pub analysis: Analysis,
-    views: Rc<Vec<LineView>>,
-    views_gen: u64,
-    reveal: Option<Reveal>,
-    slash: Option<Slash>,
+    pub m: Model,
     goal_x: Option<Pixels>,
     pub scroll: ScrollHandle,
     layout_cache: LayoutCache,
@@ -88,21 +75,11 @@ impl Focusable for Editor {
 
 impl Editor {
     pub fn new(text: String, path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
-        let buffer = Buffer::new(text);
-        let saved_revision = buffer.revision();
-        let analysis = markdown::analyze(buffer.text());
-        let views = Rc::new(conceal::build_views(buffer.text(), &analysis, &None));
+        let m = Model::new(text);
+        let saved_revision = m.buffer.revision();
         Self {
             focus_handle: cx.focus_handle(),
-            buffer,
-            selection: 0..0,
-            reversed: false,
-            marked: None,
-            analysis,
-            views,
-            views_gen: 0,
-            reveal: None,
-            slash: None,
+            m,
             goal_x: None,
             scroll: ScrollHandle::new(),
             layout_cache: Rc::new(RefCell::new(None)),
@@ -119,16 +96,20 @@ impl Editor {
     // ---- document state -----------------------------------------------------
 
     pub fn text(&self) -> &str {
-        self.buffer.text()
+        self.m.text()
+    }
+
+    pub fn buffer(&self) -> &Buffer {
+        &self.m.buffer
     }
 
     /// The visible text without markdown markers or decoration (for counts).
     pub fn plain_text(&self) -> String {
-        conceal::plain_text(&self.views)
+        self.m.plain_text()
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.buffer.revision() != self.saved_revision
+        self.m.buffer.revision() != self.saved_revision
     }
 
     pub fn file_name(&self) -> String {
@@ -141,17 +122,12 @@ impl Editor {
 
     /// Replaces the document (used by New and Open).
     pub fn load(&mut self, text: String, path: Option<PathBuf>, cx: &mut Context<Self>) {
-        self.buffer.reset(text);
-        self.saved_revision = self.buffer.revision();
+        self.m.load(text);
+        self.saved_revision = self.m.buffer.revision();
         self.path = path;
-        self.selection = 0..0;
-        self.reversed = false;
-        self.marked = None;
-        self.reveal = None;
-        self.slash = None;
         self.scroll.set_offset(point(px(0.), px(0.)));
         self.placeholder = crate::placeholders::random();
-        self.after_edit(cx);
+        self.changed(cx);
     }
 
     /// Records a successful save of `revision` (the revision that was written).
@@ -162,7 +138,17 @@ impl Editor {
     }
 
     pub fn selected_text(&self) -> Option<&str> {
-        (!self.selection.is_empty()).then(|| &self.text()[self.selection.clone()])
+        self.m.selected_text()
+    }
+
+    /// Call after any model mutation: refreshes find matches and schedules a repaint.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if !self.find.query.is_empty() {
+            self.refresh_matches();
+        }
+        self.goal_x = None;
+        self.need_scroll = true;
+        cx.notify();
     }
 
     // ---- find ---------------------------------------------------------------
@@ -170,7 +156,7 @@ impl Editor {
     pub fn set_find_query(&mut self, query: &str, cx: &mut Context<Self>) {
         self.find.query = query.to_string();
         self.refresh_matches();
-        self.find.current = search::next_index(&self.find.matches, self.selection.start);
+        self.find.current = search::next_index(&self.find.matches, self.m.selection.start);
         self.reveal_current_match();
         cx.notify();
     }
@@ -185,11 +171,12 @@ impl Editor {
         if m.is_empty() {
             return;
         }
+        let sel = &self.m.selection;
         let idx = match (self.find.current, forward) {
             (Some(i), true) => Some((i + 1) % m.len()),
             (Some(i), false) => Some((i + m.len() - 1) % m.len()),
-            (None, true) => search::next_index(m, self.selection.end),
-            (None, false) => search::prev_index(m, self.selection.start),
+            (None, true) => search::next_index(m, sel.end),
+            (None, false) => search::prev_index(m, sel.start),
         };
         self.find.current = idx;
         self.reveal_current_match();
@@ -197,112 +184,28 @@ impl Editor {
     }
 
     fn refresh_matches(&mut self) {
-        self.find.matches = search::find_all(self.buffer.text(), &self.find.query);
+        self.find.matches = search::find_all(self.m.text(), &self.find.query);
         if self.find.current.is_some_and(|i| i >= self.find.matches.len()) {
             self.find.current = None;
         }
     }
 
     fn reveal_current_match(&mut self) {
-        if let Some(m) = self.find.current.and_then(|i| self.find.matches.get(i)).cloned() {
-            self.selection = m;
-            self.reversed = false;
+        if let Some(r) = self.find.current.and_then(|i| self.find.matches.get(i)).cloned() {
+            self.m.selection = r;
+            self.m.reversed = false;
             self.need_scroll = true;
-        }
-    }
-
-    // ---- conceal mapping ----------------------------------------------------
-
-    fn rebuild_views(&mut self) {
-        self.views = Rc::new(conceal::build_views(self.buffer.text(), &self.analysis, &self.reveal));
-        self.views_gen += 1;
-    }
-
-    fn view_at(&self, offset: usize) -> (usize, &LineView) {
-        let i = self.analysis.line_at(offset).min(self.views.len() - 1);
-        (i, &self.views[i])
-    }
-
-    /// Moves a buffer offset out of concealed text onto the nearest valid caret position.
-    fn normalize(&self, offset: usize) -> usize {
-        let offset = offset.min(self.buffer.len());
-        self.view_at(offset).1.normalize(offset)
-    }
-
-    fn prev_pos(&self, c: usize) -> usize {
-        let (i, v) = self.view_at(c);
-        let d = v.buf_to_disp(c);
-        if d > v.min_disp {
-            v.disp_to_buf(prev_grapheme_in(&v.display, d).max(v.min_disp))
-        } else if i > 0 {
-            let pv = &self.views[i - 1];
-            pv.disp_to_buf(pv.display.len())
-        } else {
-            v.normalize(c)
-        }
-    }
-
-    fn next_pos(&self, c: usize) -> usize {
-        let (i, v) = self.view_at(c);
-        let d = v.buf_to_disp(c);
-        if d < v.display.len() {
-            v.disp_to_buf(next_grapheme_in(&v.display, d))
-        } else if i + 1 < self.views.len() {
-            let nv = &self.views[i + 1];
-            nv.disp_to_buf(nv.min_disp)
-        } else {
-            c
-        }
-    }
-
-    fn prev_word_pos(&self, c: usize) -> usize {
-        let (_, v) = self.view_at(c);
-        let d = v.buf_to_disp(c);
-        if d > v.min_disp {
-            v.disp_to_buf(prev_word_in(&v.display, d).max(v.min_disp))
-        } else {
-            self.prev_pos(c)
-        }
-    }
-
-    fn next_word_pos(&self, c: usize) -> usize {
-        let (_, v) = self.view_at(c);
-        let d = v.buf_to_disp(c);
-        if d < v.display.len() {
-            v.disp_to_buf(next_word_in(&v.display, d))
-        } else {
-            self.next_pos(c)
-        }
-    }
-
-    /// Drops a reveal that no longer applies to the caret.
-    fn refresh_reveal(&mut self) {
-        if let Some(r) = &self.reveal
-            && !r.is_valid(&self.analysis, self.cursor())
-        {
-            self.reveal = None;
-            self.rebuild_views();
         }
     }
 
     // ---- selection ----------------------------------------------------------
 
     fn cursor(&self) -> usize {
-        if self.reversed { self.selection.start } else { self.selection.end }
+        self.m.cursor()
     }
 
     fn set_cursor(&mut self, offset: usize, select: bool, cx: &mut Context<Self>) {
-        let offset = self.normalize(offset);
-        if select {
-            let anchor = if self.reversed { self.selection.end } else { self.selection.start };
-            self.reversed = offset < anchor;
-            self.selection = offset.min(anchor)..offset.max(anchor);
-        } else {
-            self.selection = offset..offset;
-            self.reversed = false;
-        }
-        self.refresh_reveal();
-        self.sync_slash();
+        self.m.set_cursor(offset, select);
         self.need_scroll = true;
         cx.notify();
     }
@@ -320,7 +223,7 @@ impl Editor {
         let target = if y < px(0.) {
             0
         } else if y >= layout.height {
-            self.buffer.len()
+            self.m.buffer.len()
         } else {
             layout.offset_for_point(point(goal, y))
         };
@@ -336,8 +239,8 @@ impl Editor {
         let settings = cx.global::<Settings>().clone();
         let theme = *cx.global::<Theme>();
         let key = LayoutKey {
-            revision: self.buffer.revision(),
-            views_gen: self.views_gen,
+            revision: self.m.buffer.revision(),
+            views_gen: self.m.views_gen,
             width: f32::from(width).to_bits(),
             font_size: settings.font_size.to_bits(),
             font: settings.font,
@@ -348,132 +251,44 @@ impl Editor {
         {
             return l.clone();
         }
-        let layout = Rc::new(layout::build(window, self.views.clone(), self.buffer.len(), &settings, &theme, width));
+        let layout = Rc::new(layout::build(window, self.m.views.clone(), self.m.buffer.len(), &settings, &theme, width));
         *self.layout_cache.borrow_mut() = Some((key, layout.clone()));
         layout
-    }
-
-    // ---- editing ------------------------------------------------------------
-
-    fn edit(&mut self, range: Range<usize>, text: &str, cx: &mut Context<Self>) {
-        self.edit_caret(range, text, None, cx);
-    }
-
-    fn edit_caret(&mut self, range: Range<usize>, text: &str, caret: Option<usize>, cx: &mut Context<Self>) {
-        let before = self.selection.clone();
-        let (at, removed) = (range.start, range.len());
-        let c = self.buffer.replace(range, text, before);
-        if let Some(r) = &mut self.reveal {
-            r.adjust(at, removed, text.len());
-        }
-        let c = caret.unwrap_or(c);
-        self.selection = c..c;
-        self.reversed = false;
-        self.marked = None;
-        self.after_edit(cx);
-    }
-
-    fn after_edit(&mut self, cx: &mut Context<Self>) {
-        self.analysis = markdown::analyze(self.buffer.text());
-        if let Some(r) = &self.reveal
-            && !r.is_valid(&self.analysis, self.selection.end.min(self.buffer.len()))
-        {
-            self.reveal = None;
-        }
-        self.rebuild_views();
-        if self.selection.is_empty() {
-            let c = self.normalize(self.selection.end);
-            self.selection = c..c;
-        }
-        if !self.find.query.is_empty() {
-            self.refresh_matches();
-        }
-        self.sync_slash();
-        self.goal_x = None;
-        self.need_scroll = true;
-        cx.notify();
-    }
-
-    fn delete_range_or(&mut self, fallback: Range<usize>, cx: &mut Context<Self>) {
-        let r = if self.selection.is_empty() { fallback } else { self.selection.clone() };
-        if !r.is_empty() {
-            self.edit(r, "", cx);
-        }
-    }
-
-    fn insert(&mut self, text: &str, cx: &mut Context<Self>) {
-        self.edit(self.selection.clone(), text, cx);
-    }
-
-    fn line_lead(&self, li: usize) -> Option<&Lead> {
-        self.analysis.lines.get(li).and_then(|l| l.lead.as_ref())
-    }
-
-    // ---- slash menu ---------------------------------------------------------
-
-    fn slash_query(&self) -> Option<String> {
-        let s = self.slash.as_ref()?;
-        slash::query(self.text(), s.start, self.selection.end).map(str::to_string)
-    }
-
-    fn sync_slash(&mut self) {
-        if self.slash.is_none() {
-            return;
-        }
-        let n = self.slash_query().map(|q| slash::filter(&q).len()).unwrap_or(0);
-        match &mut self.slash {
-            Some(s) if n > 0 && self.selection.is_empty() => s.selected = s.selected.min(n - 1),
-            _ => self.slash = None,
-        }
-    }
-
-    fn slash_pick(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(start) = self.slash.as_ref().map(|s| s.start) else { return };
-        let Some(q) = self.slash_query() else { return };
-        let Some(item) = slash::filter(&q).get(index).copied() else { return };
-        let end = self.selection.end;
-        let (text, caret) = slash::replacement(item.block, self.text(), start);
-        self.slash = None;
-        self.edit_caret(start..end, &text, Some(start + caret), cx);
     }
 
     // ---- action handlers ----------------------------------------------------
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        let t = if self.selection.is_empty() { self.prev_pos(self.cursor()) } else { self.selection.start };
-        self.horizontal(t, false, cx);
+        self.goal_x = None;
+        self.m.move_left(false);
+        self.moved(cx);
     }
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        let t = if self.selection.is_empty() { self.next_pos(self.cursor()) } else { self.selection.end };
-        self.horizontal(t, false, cx);
+        self.goal_x = None;
+        self.m.move_right(false);
+        self.moved(cx);
     }
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash.is_some() {
-            let n = self.slash_query().map(|q| slash::filter(&q).len()).unwrap_or(1).max(1);
-            if let Some(s) = &mut self.slash {
-                s.selected = (s.selected + n - 1) % n;
-            }
+        if self.m.slash.is_some() {
+            self.m.slash_move(-1);
             cx.notify();
             return;
         }
         self.vertical(-1, false, cx);
     }
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash.is_some() {
-            let n = self.slash_query().map(|q| slash::filter(&q).len()).unwrap_or(1).max(1);
-            if let Some(s) = &mut self.slash {
-                s.selected = (s.selected + 1) % n;
-            }
+        if self.m.slash.is_some() {
+            self.m.slash_move(1);
             cx.notify();
             return;
         }
         self.vertical(1, false, cx);
     }
     fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.prev_word_pos(self.cursor()), false, cx);
+        self.horizontal(self.m.prev_word_pos(self.cursor()), false, cx);
     }
     fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.next_word_pos(self.cursor()), false, cx);
+        self.horizontal(self.m.next_word_pos(self.cursor()), false, cx);
     }
     fn line_start(&mut self, _: &LineStart, _: &mut Window, cx: &mut Context<Self>) {
         let t = self.visual_line_edge(true);
@@ -487,13 +302,13 @@ impl Editor {
         self.horizontal(0, false, cx);
     }
     fn doc_end(&mut self, _: &DocEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.buffer.len(), false, cx);
+        self.horizontal(self.m.buffer.len(), false, cx);
     }
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.prev_pos(self.cursor()), true, cx);
+        self.horizontal(self.m.prev_pos(self.cursor()), true, cx);
     }
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.next_pos(self.cursor()), true, cx);
+        self.horizontal(self.m.next_pos(self.cursor()), true, cx);
     }
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         self.vertical(-1, true, cx);
@@ -502,10 +317,10 @@ impl Editor {
         self.vertical(1, true, cx);
     }
     fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.prev_word_pos(self.cursor()), true, cx);
+        self.horizontal(self.m.prev_word_pos(self.cursor()), true, cx);
     }
     fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.next_word_pos(self.cursor()), true, cx);
+        self.horizontal(self.m.next_word_pos(self.cursor()), true, cx);
     }
     fn select_line_start(&mut self, _: &SelectLineStart, _: &mut Window, cx: &mut Context<Self>) {
         let t = self.visual_line_edge(true);
@@ -519,11 +334,16 @@ impl Editor {
         self.horizontal(0, true, cx);
     }
     fn select_doc_end(&mut self, _: &SelectDocEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.horizontal(self.buffer.len(), true, cx);
+        self.horizontal(self.m.buffer.len(), true, cx);
     }
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.selection = 0..self.buffer.len();
-        self.reversed = false;
+        self.m.select_all();
+        cx.notify();
+    }
+
+    /// Cursor-only change: repaint and keep the caret visible.
+    fn moved(&mut self, cx: &mut Context<Self>) {
+        self.need_scroll = true;
         cx.notify();
     }
 
@@ -536,110 +356,44 @@ impl Editor {
             let x = if start { px(0.) } else { layout.width + px(1000.) };
             return layout.offset_for_point(point(x, pt.y + lh / 2.));
         }
-        let (_, v) = self.view_at(cursor);
-        if start { v.content_start() } else { v.disp_to_buf(v.display.len()) }
+        self.m.logical_line_edge(start)
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        if self.selection.is_empty() {
-            // First Backspace into a concealed marker reveals it instead of deleting.
-            if let Some(r) = conceal::on_backspace(&self.analysis, c, &self.reveal) {
-                self.reveal = Some(r);
-                self.rebuild_views();
-                self.need_scroll = true;
-                cx.notify();
-                return;
-            }
-            let p = self.prev_pos(c);
-            self.delete_range_or(p..c, cx);
-        } else {
-            self.delete_range_or(c..c, cx);
-        }
+        self.m.backspace();
+        self.changed(cx);
     }
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        self.delete_range_or(c..self.next_pos(c), cx);
+        self.m.delete();
+        self.changed(cx);
     }
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        self.delete_range_or(self.prev_word_pos(c)..c, cx);
+        self.m.delete_word_left();
+        self.changed(cx);
     }
     fn delete_to_line_start(&mut self, _: &DeleteToLineStart, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        let cs = self.view_at(c).1.content_start();
-        let from = if cs < c { cs } else { self.prev_pos(c) };
-        self.delete_range_or(from..c, cx);
+        self.m.delete_to_line_start();
+        self.changed(cx);
     }
-
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(i) = self.slash.as_ref().map(|s| s.selected) {
-            self.slash_pick(i, cx);
-            return;
-        }
-        let c = self.cursor();
-        let (li, _) = self.view_at(c);
-        let in_code = self.analysis.lines[li].kind == LineKind::Code;
-        if !in_code && self.selection.is_empty() && c == self.buffer.line_end(c) {
-            let ls = self.buffer.line_start(c);
-            match markdown::continuation(&self.text()[ls..c]) {
-                Some(Continuation::Clear(_)) => {
-                    self.edit(ls..c, "", cx);
-                    return;
-                }
-                Some(Continuation::Continue(prefix)) => {
-                    self.insert(&format!("\n{prefix}"), cx);
-                    return;
-                }
-                None => {}
-            }
-        }
-        // Keep the current line's indentation.
-        let ls = self.buffer.line_start(self.selection.start);
-        let indent: String = self.text()[ls..].chars().take_while(|c| *c == ' ').collect();
-        let indent = &indent[..indent.len().min(self.selection.start - ls)];
-        self.insert(&format!("\n{indent}"), cx);
+        self.m.enter();
+        self.changed(cx);
     }
-
-    fn is_list_line(&self, li: usize) -> bool {
-        matches!(self.line_lead(li), Some(Lead::Bullet { .. } | Lead::Ordered { .. } | Lead::Task { .. }))
-    }
-
     fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        let li = self.analysis.line_at(c);
-        if self.selection.is_empty() && self.is_list_line(li) {
-            let ls = self.analysis.lines[li].start;
-            self.edit_caret(ls..ls, "    ", Some(c + 4), cx);
-        } else {
-            self.insert("    ", cx);
-        }
+        self.m.tab();
+        self.changed(cx);
     }
-
     fn backtab(&mut self, _: &Backtab, _: &mut Window, cx: &mut Context<Self>) {
-        let c = self.cursor();
-        let li = self.analysis.line_at(c);
-        let ls = self.analysis.lines[li].start;
-        let n = self.text()[ls..].bytes().take_while(|b| *b == b' ').count().min(4);
-        if n > 0 && self.selection.is_empty() {
-            self.edit_caret(ls..ls + n, "", Some(c.saturating_sub(n).max(ls)), cx);
-        }
+        self.m.backtab();
+        self.changed(cx);
     }
-
-    fn toggle_task(&mut self, li: usize, cx: &mut Context<Self>) {
-        if let Some(Lead::Task { bracket, checked, .. }) = self.line_lead(li).cloned() {
-            let c = self.cursor();
-            self.edit_caret(bracket.start + 1..bracket.start + 2, if checked { " " } else { "x" }, Some(c), cx);
-        }
-    }
-
     fn toggle_check(&mut self, _: &ToggleCheck, _: &mut Window, cx: &mut Context<Self>) {
-        let li = self.analysis.line_at(self.cursor());
-        self.toggle_task(li, cx);
+        self.m.toggle_check();
+        self.changed(cx);
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash.take().is_some() {
+        if self.m.slash.take().is_some() {
             cx.notify();
         } else {
             cx.propagate();
@@ -652,33 +406,24 @@ impl Editor {
         }
     }
     fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(t) = self.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(t.to_string()));
-            self.edit(self.selection.clone(), "", cx);
+        if let Some(t) = self.m.cut() {
+            cx.write_to_clipboard(ClipboardItem::new_string(t));
+            self.changed(cx);
         }
     }
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-            self.insert(&t, cx);
+            self.m.insert(&t);
+            self.changed(cx);
         }
     }
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(sel) = self.buffer.undo() {
-            self.restore(sel, cx);
-        }
+        self.m.undo();
+        self.changed(cx);
     }
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(sel) = self.buffer.redo() {
-            self.restore(sel, cx);
-        }
-    }
-    fn restore(&mut self, sel: Range<usize>, cx: &mut Context<Self>) {
-        let len = self.buffer.len();
-        self.selection = sel.start.min(len)..sel.end.min(len);
-        self.reversed = false;
-        self.marked = None;
-        self.reveal = None;
-        self.after_edit(cx);
+        self.m.redo();
+        self.changed(cx);
     }
 
     // ---- mouse --------------------------------------------------------------
@@ -701,7 +446,8 @@ impl Editor {
     }
 
     fn link_at(&self, off: usize) -> Option<String> {
-        self.analysis
+        self.m
+            .analysis
             .inlines
             .iter()
             .find(|i| i.url.is_some() && i.full.start <= off && off <= i.full.end)
@@ -711,7 +457,8 @@ impl Editor {
     fn mouse_down(&mut self, e: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         if let Some(li) = self.checkbox_at(e.position) {
-            self.toggle_task(li, cx);
+            self.m.toggle_task(li);
+            self.changed(cx);
             return;
         }
         let off = self.offset_at(e.position);
@@ -725,19 +472,19 @@ impl Editor {
         self.goal_x = None;
         match e.click_count {
             2 => {
-                self.selection = self.buffer.word_range(off);
-                self.reversed = false;
+                self.m.selection = self.m.buffer.word_range(off);
+                self.m.reversed = false;
                 cx.notify();
             }
             n if n >= 3 => {
-                let end = (self.buffer.line_end(off) + 1).min(self.buffer.len());
-                self.selection = self.buffer.line_start(off)..end;
-                self.reversed = false;
+                let end = (self.m.buffer.line_end(off) + 1).min(self.m.buffer.len());
+                self.m.selection = self.m.buffer.line_start(off)..end;
+                self.m.reversed = false;
                 cx.notify();
             }
             _ => self.set_cursor(off, e.modifiers.shift, cx),
         }
-        self.slash = None;
+        self.m.slash = None;
         self.need_scroll = false;
     }
     fn mouse_move(&mut self, e: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -797,35 +544,21 @@ impl EntityInputHandler for Editor {
     }
 
     fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: self.range_to_utf16(&self.selection), reversed: self.reversed })
+        Some(UTF16Selection { range: self.range_to_utf16(&self.m.selection), reversed: self.m.reversed })
     }
 
     fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
-        self.marked.as_ref().map(|r| self.range_to_utf16(r))
+        self.m.marked.as_ref().map(|r| self.range_to_utf16(r))
     }
 
     fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
-        self.marked = None;
+        self.m.marked = None;
     }
 
     fn replace_text_in_range(&mut self, range_utf16: Option<Range<usize>>, text: &str, _: &mut Window, cx: &mut Context<Self>) {
-        let range = range_utf16
-            .as_ref()
-            .map(|r| self.range_from_utf16(r))
-            .or(self.marked.clone())
-            .unwrap_or(self.selection.clone());
-        self.edit(range, text, cx);
-        if text.chars().count() == 1 {
-            let c = self.cursor();
-            let in_code = self.analysis.lines[self.analysis.line_at(c)].kind == LineKind::Code;
-            if let Some(e) = shortcuts::after_insert(self.text(), c, text, in_code) {
-                self.edit_caret(e.range, &e.text, Some(e.caret), cx);
-            } else if text == "/" && slash::should_open(self.text(), c) {
-                self.slash = Some(Slash { start: c - 1, selected: 0 });
-                self.sync_slash();
-                cx.notify();
-            }
-        }
+        let range = range_utf16.as_ref().map(|r| self.range_from_utf16(r));
+        self.m.replace_text(range, text);
+        self.changed(cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -839,11 +572,11 @@ impl EntityInputHandler for Editor {
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
-            .or(self.marked.clone())
-            .unwrap_or(self.selection.clone());
-        self.edit(range.clone(), text, cx);
+            .or(self.m.marked.clone())
+            .unwrap_or(self.m.selection.clone());
+        self.m.insert_range(range.clone(), text);
         if !text.is_empty() {
-            self.marked = Some(range.start..range.start + text.len());
+            self.m.marked = Some(range.start..range.start + text.len());
         }
         if let Some(sel) = new_selected_utf16 {
             // Offsets are relative to the inserted text.
@@ -858,9 +591,9 @@ impl EntityInputHandler for Editor {
                 }
                 b
             };
-            self.selection = range.start + conv(sel.start)..range.start + conv(sel.end);
+            self.m.set_selection(range.start + conv(sel.start)..range.start + conv(sel.end));
         }
-        cx.notify();
+        self.changed(cx);
     }
 
     fn bounds_for_range(&mut self, range_utf16: Range<usize>, bounds: Bounds<Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<Bounds<Pixels>> {
@@ -877,8 +610,8 @@ impl EntityInputHandler for Editor {
 
 impl Editor {
     fn slash_popup(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
-        let query = self.slash_query()?;
-        let selected = self.slash.as_ref()?.selected;
+        let query = self.m.slash_query()?;
+        let selected = self.m.slash.as_ref()?.selected;
         let layout = self.current_layout()?;
         let (p, lh) = layout.point_for_offset(self.cursor())?;
         let theme = *cx.global::<Theme>();
@@ -899,7 +632,8 @@ impl Editor {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
-                        this.slash_pick(i, cx);
+                        this.m.slash_pick(i);
+                        this.changed(cx);
                         cx.stop_propagation();
                     }),
                 )
@@ -1002,9 +736,9 @@ impl Editor {
         self.cursor()
     }
     pub(crate) fn selection(&self) -> Range<usize> {
-        self.selection.clone()
+        self.m.selection.clone()
     }
-    pub(crate) fn marked(&self) -> Option<Range<usize>> {
-        self.marked.clone()
+    pub(crate) fn is_empty(&self) -> bool {
+        self.m.buffer.is_empty()
     }
 }

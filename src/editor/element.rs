@@ -9,8 +9,8 @@ use gpui::{
 };
 use std::rc::Rc;
 
-use super::layout::{Layout, metrics};
-use crate::markdown::LineKind;
+use super::layout::{Layout, PANEL_MARGIN, PANEL_PAD, metrics};
+use crate::markdown::{CodeRole, LineKind};
 use crate::settings::Settings;
 
 pub struct EditorElement {
@@ -111,20 +111,18 @@ impl Element for EditorElement {
     ) {
         let theme = *cx.global::<Theme>();
         let settings = cx.global::<Settings>().clone();
-        let (focus, selection, caret, marked, empty, matches, current, placeholder) = {
+        let (focus, selection, caret, empty, matches, current, placeholder) = {
             let ed = self.editor.read(cx);
             (
                 ed.focus_handle.clone(),
                 ed.selection(),
                 ed.caret(),
-                ed.marked(),
-                ed.buffer.is_empty(),
+                ed.is_empty(),
                 ed.find.matches.clone(),
                 ed.find.current,
                 ed.placeholder,
             )
         };
-        let _ = marked;
         self.editor.update(cx, |ed, _| ed.set_origin(bounds.origin));
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.editor.clone()), cx);
 
@@ -139,29 +137,59 @@ impl Element for EditorElement {
         }
         let lines = &layout.lines[first..last];
 
-        // Block backgrounds: code blocks, quote bars, rules.
-        let mut i = 0;
-        while i < lines.len() {
-            let l = &lines[i];
+        // Code panels: one continuous rounded panel per fenced block.
+        let mut i = first;
+        while i < last {
+            let Some(code) = layout.views[i].code.as_ref() else {
+                i += 1;
+                continue;
+            };
+            let block = code.block;
+            let mut j = i;
+            while j + 1 < last && layout.views[j + 1].code.as_ref().is_some_and(|c| c.block == block) {
+                j += 1;
+            }
+            let (head, tail) = (&layout.lines[i], &layout.lines[j]);
+            let hidden = |k: usize| layout.views[k].fence_hidden;
+            let opens = matches!(layout.views[i].code.as_ref().map(|c| &c.role), Some(CodeRole::Open { .. }));
+            let closes = matches!(layout.views[j].code.as_ref().map(|c| &c.role), Some(CodeRole::Close));
+            // Concealed fence rows are the panel's own padding; open ends get padding added.
+            let y0 = head.y + if opens && hidden(i) { px(PANEL_MARGIN) } else if opens { px(0.) } else { px(-PANEL_PAD * 0.6) };
+            let y1 = tail.y + tail.height - if closes && hidden(j) { px(PANEL_MARGIN) } else if closes { px(0.) } else { px(-PANEL_PAD * 0.6) };
+            let mut q = fill(
+                Bounds::new(
+                    point(origin.x - px(PANEL_PAD), origin.y + y0),
+                    size(bounds.size.width + px(PANEL_PAD * 2.), y1 - y0),
+                ),
+                theme.code_bg,
+            );
+            q.corner_radii = px(10.).into();
+            window.paint_quad(q);
+            if opens
+                && hidden(i)
+                && let Some(CodeRole::Open { lang }) = layout.views[i].code.as_ref().map(|c| &c.role)
+                && !lang.is_empty()
+            {
+                let text: gpui::SharedString = lang.clone().into();
+                let run = TextRun {
+                    len: text.len(),
+                    font: gpui::font(crate::settings::MONO_FAMILY),
+                    color: theme.muted,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(text, px(11.), &[run], None);
+                let at = point(origin.x + bounds.size.width + px(PANEL_PAD - 10.) - shaped.width, origin.y + y0 + px(6.));
+                let _ = shaped.paint(at, px(14.), window, cx);
+            }
+            i = j + 1;
+        }
+
+        // Quote bars and rules.
+        for li in first..last {
+            let l = &layout.lines[li];
             match l.kind {
-                LineKind::Code => {
-                    let mut j = i;
-                    while j + 1 < lines.len() && lines[j + 1].kind == LineKind::Code {
-                        j += 1;
-                    }
-                    let y0 = l.y;
-                    let y1 = lines[j].y + lines[j].height;
-                    let mut q = fill(
-                        Bounds::new(
-                            point(origin.x - px(12.), origin.y + y0 - px(2.)),
-                            size(bounds.size.width + px(24.), y1 - y0 + px(4.)),
-                        ),
-                        theme.code_bg,
-                    );
-                    q.corner_radii = px(6.).into();
-                    window.paint_quad(q);
-                    i = j;
-                }
                 LineKind::Quote => {
                     window.paint_quad(fill(
                         Bounds::new(point(origin.x - px(14.), origin.y + l.y), size(px(2.5), l.height)),
@@ -179,7 +207,24 @@ impl Element for EditorElement {
                 }
                 _ => {}
             }
-            i += 1;
+        }
+
+        // Inline code: a subtle rounded chip behind the mono text.
+        for li in first..last {
+            let line = &layout.lines[li];
+            for range in &layout.views[li].code_spans {
+                for r in layout.rects_for_disp(li, range.clone(), false) {
+                    let h = line.font_size * 1.3;
+                    let pad = px(2.);
+                    let b = Bounds::new(
+                        origin + point(r.origin.x - pad, r.origin.y + (r.size.height - h) / 2.),
+                        size(r.size.width + pad * 2., h),
+                    );
+                    let mut q = fill(b, theme.code_bg);
+                    q.corner_radii = px(4.).into();
+                    window.paint_quad(q);
+                }
+            }
         }
 
         // Find highlights.

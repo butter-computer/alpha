@@ -55,8 +55,7 @@ impl Element for BlurSplit {
         None
     }
     fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
-        let mut style = Style::default();
-        style.position = Position::Absolute;
+        let style = Style { position: Position::Absolute, ..Default::default() };
         (window.request_layout(style, [], cx), ())
     }
     fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: gpui::Bounds<gpui::Pixels>, _: &mut (), _: &mut Window, _: &mut App) {}
