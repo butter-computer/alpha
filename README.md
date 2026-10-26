@@ -22,6 +22,16 @@ open target/release/bundle/Alpha.app
 
 Builds a release binary and assembles an ad-hoc-signed `Alpha.app` (name, icon, `.md`/`.markdown`/`.txt` document types) so it shows up properly in the Dock and Cmd-Tab. The placeholder icon lives in `assets/icon/`.
 
+## Release DMG
+
+```sh
+scripts/make-dmg.sh   # -> target/release/Alpha-<version>-arm64.dmg
+```
+
+Runs `bundle-mac.sh`, then packs `Alpha.app` and an `/Applications` shortcut into a compressed DMG (volume `Alpha`, volume icon from `Alpha.icns`, icon-view window with the toolbar hidden; the layout is skipped with a note if Finder scripting is not permitted).
+
+The app is **ad-hoc signed only**: there is no Developer ID, so it is not notarized. On first launch macOS will refuse to open it from a double-click. Drag Alpha to Applications, then **right-click (or Control-click) Alpha.app > Open > Open** once; after that it opens normally. If macOS still blocks it, run `xattr -dr com.apple.quarantine /Applications/Alpha.app`.
+
 ## Shortcuts
 
 | Shortcut | Action |
