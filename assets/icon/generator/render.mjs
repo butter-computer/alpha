@@ -11,8 +11,8 @@ import path from "node:path";
 
 const here = path.dirname(new URL(import.meta.url).pathname);
 const outDir = path.resolve(process.argv[2] || "out");
-const names = { v1: "parquet-inlay", v2: "rosewood-oval", v3: "pieced-grain", v4: "open-book", v5: "minimal-seam", v6: "sunburst-rosette" };
-const which = process.argv.slice(3).length ? process.argv.slice(3) : Object.keys(names);
+const names = { v1: "parquet-inlay", v2: "rosewood-oval", v3: "pieced-grain", v4: "open-book", v5: "minimal-seam", v6: "sunburst-rosette", play: "playground" }; // play = interactive.html defaults (Playfair Display 700)
+const which = process.argv.slice(3).length ? process.argv.slice(3) : Object.keys(names).filter(v => v !== "play");
 mkdirSync(outDir, { recursive: true });
 
 const mime = { ".html": "text/html", ".js": "text/javascript" };
@@ -42,7 +42,7 @@ const SESSION = "alpha-icon-gen"; // dedicated session so other agent-browser us
 const ab = (...a) => run("agent-browser", ["--session", SESSION, ...a], { timeout: 300000 });
 try {
   for (const v of which) {
-    await ab("open", `http://127.0.0.1:${port}/?v=${v}`);
+    await ab("open", v === "play" ? `http://127.0.0.1:${port}/interactive.html?auto=1` : `http://127.0.0.1:${port}/?v=${v}`);
     await ab("wait", "--fn", "window.__done === true");
   }
 } finally {
