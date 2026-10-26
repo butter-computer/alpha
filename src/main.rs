@@ -1,4 +1,5 @@
 mod actions;
+mod conceal;
 mod editor;
 mod export;
 mod findbar;
@@ -9,6 +10,8 @@ mod markdown;
 mod palette;
 mod placeholders;
 mod search;
+mod shortcuts;
+mod slash;
 mod settings;
 mod stats;
 mod theme;

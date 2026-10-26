@@ -191,8 +191,11 @@ impl Element for EditorElement {
                 }
                 let color = if Some(idx) == current { theme.find_current } else { theme.find };
                 let li = layout.line_index_for_offset(m.start);
-                for line in layout.lines[li..].iter().take_while(|l| l.start <= m.end) {
-                    for r in layout.rects_for_range(line, m.clone()) {
+                for lj in li..layout.lines.len() {
+                    if layout.lines[lj].start > m.end {
+                        break;
+                    }
+                    for r in layout.rects_for_range(lj, m.clone()) {
                         let mut q = fill(Bounds::new(origin + r.origin, r.size), color);
                         q.corner_radii = px(2.).into();
                         window.paint_quad(q);
@@ -203,8 +206,12 @@ impl Element for EditorElement {
 
         // Selection.
         if !selection.is_empty() {
-            for line in lines.iter().filter(|l| l.end >= selection.start && l.start <= selection.end) {
-                for r in layout.rects_for_range(line, selection.clone()) {
+            for li in first..last {
+                let line = &layout.lines[li];
+                if line.end < selection.start || line.start > selection.end {
+                    continue;
+                }
+                for r in layout.rects_for_range(li, selection.clone()) {
                     window.paint_quad(fill(Bounds::new(origin + r.origin, r.size), theme.selection));
                 }
             }
@@ -216,6 +223,44 @@ impl Element for EditorElement {
                 let o = point(origin.x, origin.y + line.y + line.pad_top);
                 let _ = w.paint_background(o, line.line_height, TextAlign::Left, None, window, cx);
                 let _ = w.paint(o, line.line_height, TextAlign::Left, None, window, cx);
+            }
+        }
+
+        // Checkboxes.
+        for li in first..last {
+            let Some(cb) = layout.views[li].checkbox.as_ref() else { continue };
+            let Some(r) = layout.checkbox_rect(li) else { continue };
+            let b = Bounds::new(origin + r.origin, r.size);
+            if cb.checked {
+                let mut q = fill(b, theme.accent);
+                q.corner_radii = px(3.).into();
+                window.paint_quad(q);
+                let text: gpui::SharedString = "✓".into();
+                let run = TextRun {
+                    len: text.len(),
+                    font: gpui::font(settings.font.family()),
+                    color: theme.bg,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(text, r.size.height * 0.85, &[run], None);
+                let w = shaped.width;
+                let _ = shaped.paint(
+                    point(b.origin.x + (b.size.width - w) / 2., b.origin.y + r.size.height * 0.04),
+                    r.size.height,
+                    window,
+                    cx,
+                );
+            } else {
+                window.paint_quad(gpui::quad(
+                    b,
+                    px(3.),
+                    gpui::transparent_black(),
+                    px(1.5),
+                    theme.muted,
+                    gpui::BorderStyle::Solid,
+                ));
             }
         }
 

@@ -109,59 +109,6 @@ impl Buffer {
 
     // ---- navigation helpers -------------------------------------------------
 
-    pub fn prev_grapheme(&self, offset: usize) -> usize {
-        use unicode_segmentation::UnicodeSegmentation;
-        self.text[..offset].grapheme_indices(true).next_back().map(|(i, _)| i).unwrap_or(0)
-    }
-
-    pub fn next_grapheme(&self, offset: usize) -> usize {
-        use unicode_segmentation::UnicodeSegmentation;
-        self.text[offset..]
-            .graphemes(true)
-            .next()
-            .map(|g| offset + g.len())
-            .unwrap_or(self.text.len())
-    }
-
-    pub fn prev_word(&self, offset: usize) -> usize {
-        let mut chars = self.text[..offset].char_indices().rev().peekable();
-        while let Some((_, c)) = chars.peek() {
-            if c.is_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        let Some(&(mut pos, first)) = chars.peek() else { return 0 };
-        let class = word_class(first);
-        for (i, c) in chars {
-            if word_class(c) != class {
-                return pos;
-            }
-            pos = i;
-        }
-        pos
-    }
-
-    pub fn next_word(&self, offset: usize) -> usize {
-        let mut it = self.text[offset..].char_indices().peekable();
-        while let Some((_, c)) = it.peek() {
-            if c.is_whitespace() {
-                it.next();
-            } else {
-                break;
-            }
-        }
-        let Some(&(_, first)) = it.peek() else { return self.text.len() };
-        let class = word_class(first);
-        for (i, c) in it {
-            if word_class(c) != class {
-                return offset + i;
-            }
-        }
-        self.text.len()
-    }
-
     /// The run of same-class characters (word or punctuation) around `offset`.
     pub fn word_range(&self, offset: usize) -> Range<usize> {
         let before = self.text[..offset].chars().next_back();
@@ -197,6 +144,47 @@ impl Buffer {
     pub fn line_end(&self, offset: usize) -> usize {
         self.text[offset..].find('\n').map(|i| offset + i).unwrap_or(self.text.len())
     }
+}
+
+pub fn prev_grapheme_in(text: &str, offset: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    text[..offset].grapheme_indices(true).next_back().map(|(i, _)| i).unwrap_or(0)
+}
+
+pub fn next_grapheme_in(text: &str, offset: usize) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    text[offset..].graphemes(true).next().map(|g| offset + g.len()).unwrap_or(text.len())
+}
+
+pub fn prev_word_in(text: &str, offset: usize) -> usize {
+    let mut chars = text[..offset].char_indices().rev().peekable();
+    while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
+        chars.next();
+    }
+    let Some(&(mut pos, first)) = chars.peek() else { return 0 };
+    let class = word_class(first);
+    for (i, c) in chars {
+        if word_class(c) != class {
+            return pos;
+        }
+        pos = i;
+    }
+    pos
+}
+
+pub fn next_word_in(text: &str, offset: usize) -> usize {
+    let mut it = text[offset..].char_indices().peekable();
+    while it.peek().is_some_and(|(_, c)| c.is_whitespace()) {
+        it.next();
+    }
+    let Some(&(_, first)) = it.peek() else { return text.len() };
+    let class = word_class(first);
+    for (i, c) in it {
+        if word_class(c) != class {
+            return offset + i;
+        }
+    }
+    text.len()
 }
 
 fn word_class(c: char) -> u8 {
@@ -252,16 +240,16 @@ mod tests {
     #[test]
     fn graphemes_and_words() {
         let b = Buffer::new("héllo wörld  foo");
-        assert_eq!(b.next_grapheme(0), 1);
-        assert_eq!(b.next_grapheme(1), 3);
-        assert_eq!(b.prev_grapheme(3), 1);
-        assert_eq!(b.next_word(0), 6);
-        assert_eq!(b.next_word(6), 13);
-        assert_eq!(b.next_word(b.len()), b.len());
-        assert_eq!(b.prev_word(b.len()), 15);
-        assert_eq!(b.prev_word(15), 7);
-        assert_eq!(b.prev_word(7), 0);
-        assert_eq!(b.prev_word(0), 0);
+        assert_eq!(next_grapheme_in(b.text(), 0), 1);
+        assert_eq!(next_grapheme_in(b.text(), 1), 3);
+        assert_eq!(prev_grapheme_in(b.text(), 3), 1);
+        assert_eq!(next_word_in(b.text(), 0), 6);
+        assert_eq!(next_word_in(b.text(), 6), 13);
+        assert_eq!(next_word_in(b.text(), b.len()), b.len());
+        assert_eq!(prev_word_in(b.text(), b.len()), 15);
+        assert_eq!(prev_word_in(b.text(), 15), 7);
+        assert_eq!(prev_word_in(b.text(), 7), 0);
+        assert_eq!(prev_word_in(b.text(), 0), 0);
     }
 
     #[test]

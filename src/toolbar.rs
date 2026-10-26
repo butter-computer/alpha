@@ -25,9 +25,9 @@ fn button(id: &'static str, label: &'static str, theme: Theme) -> gpui::Stateful
 pub fn render(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let theme = *cx.global::<Theme>();
     let editor = ws.editor.read(cx);
-    let text = editor.text();
-    let words = stats::word_count(text);
-    let chars = stats::char_count(text);
+    let text = editor.plain_text();
+    let words = stats::word_count(&text);
+    let chars = stats::char_count(&text);
     let name: SharedString = editor.file_name().into();
     let dirty = editor.is_dirty();
     let notice = ws.notice.clone();

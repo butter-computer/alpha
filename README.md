@@ -33,14 +33,27 @@ Export (Markdown or HTML) is in the toolbar's Export button and the palette.
 Settings (theme, font size, font) are saved to `settings.json` in the platform config dir
 (`~/Library/Application Support/alpha/` on macOS).
 
+## Notion-style editing
+
+You type markdown; once a shortcut completes the markers are hidden (not dimmed). The buffer stays plain
+markdown, so files save and load as real `.md`.
+
+- Blocks: `# `/`## `/`### ` headings, `- `/`* ` bullets, `1. ` numbered, `[] ` or `- [ ] ` checklist (click the box
+  or ⌘Enter to toggle), `> ` quote, ` ``` ` code block, `---` divider.
+- Inline: `**bold**` (Medium weight), `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)` (⌘-click opens).
+- Enter continues a list (empty item exits it); Tab / ⇧Tab indent / outdent list items.
+- Backspace right after a hidden marker first reveals it as raw text; moving away re-hides it.
+- Type `/` on an empty line for the block menu.
+
 ## Layout
 
 - `src/editor/` buffer + undo, layout, custom GPUI element, input handling
-- `src/markdown.rs` pulldown-cmark based span analysis
+- `src/markdown.rs` block scanner + pulldown-cmark inline spans; `src/conceal.rs` conceal layer, offset mapping, backspace reveal
+- `src/shortcuts.rs`, `src/slash.rs` typed-shortcut rewrites and the `/` menu
 - `src/fonts.rs` bundled default serif (EB Garamond, OFL; see `assets/fonts/OFL.txt`)
 - `toolbar.rs`, `palette.rs`, `findbar.rs`, `settings.rs`, `theme.rs`, `export.rs`, `workspace.rs`
 
 ## Known gaps
 
-Markdown syntax markers are dimmed, not hidden. No images, tables or nested-list rendering beyond plain styling.
+No images or tables. Wrapped list lines don't get a hanging indent.
 Open accepts any UTF-8 text file (the native picker is not filtered to .md/.txt).

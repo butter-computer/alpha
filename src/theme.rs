@@ -7,10 +7,8 @@ pub struct Theme {
     pub dark: bool,
     pub bg: Hsla,
     pub fg: Hsla,
-    /// Markdown syntax markers on the active line.
+    /// Markdown syntax markers while revealed.
     pub marker: Hsla,
-    /// Markdown syntax markers elsewhere.
-    pub marker_faint: Hsla,
     /// Placeholder, toolbar text, secondary labels.
     pub muted: Hsla,
     pub accent: Hsla,
@@ -33,7 +31,6 @@ impl Theme {
             bg: rgb(0xFBFAF7).into(),
             fg: rgb(0x2A2723).into(),
             marker: rgba(0x2A272366).into(),
-            marker_faint: rgba(0x2A272338).into(),
             muted: rgb(0x9A948A).into(),
             accent: rgb(0x9A5530).into(),
             code_bg: rgba(0x2A27230C).into(),
@@ -53,7 +50,6 @@ impl Theme {
             bg: rgb(0x1C1B1A).into(),
             fg: rgb(0xE2DED8).into(),
             marker: rgba(0xE2DED87A).into(),
-            marker_faint: rgba(0xE2DED84A).into(),
             muted: rgb(0x7D7870).into(),
             accent: rgb(0xDCA680).into(),
             code_bg: rgba(0xFFFFFF10).into(),
