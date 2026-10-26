@@ -49,7 +49,7 @@ markdown, so files save and load as real `.md`.
 
 - Blocks: `# `/`## `/`### ` headings, `- `/`* ` bullets, `1. ` numbered, `[] ` or `- [ ] ` checklist (click the box
   or ⌘Enter to toggle), `> ` quote, ` ``` ` code block, `---` divider.
-- Inline: `**bold**` (Medium weight), `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)` (⌘-click opens).
+- Inline: `**bold**` (SemiBold weight), `*italic*`, `` `code` ``, `~~strike~~`, `[text](url)` (⌘-click opens).
 - Enter continues a list (empty item exits it); Tab / ⇧Tab indent / outdent list items.
 - Backspace right after a hidden marker first reveals it as raw text; moving away re-hides it.
 - Type `/` on an empty line for the block menu.
